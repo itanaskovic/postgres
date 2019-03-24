@@ -4,7 +4,7 @@
  *	  POSTGRES low-level lock mechanism
  *
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/storage/lock.h
@@ -404,15 +404,15 @@ typedef struct LOCALLOCK
 	LOCALLOCKTAG tag;			/* unique identifier of locallock entry */
 
 	/* data */
+	uint32		hashcode;		/* copy of LOCKTAG's hash value */
 	LOCK	   *lock;			/* associated LOCK object, if any */
 	PROCLOCK   *proclock;		/* associated PROCLOCK object, if any */
-	uint32		hashcode;		/* copy of LOCKTAG's hash value */
 	int64		nLocks;			/* total number of times lock is held */
-	bool		holdsStrongLockCount;	/* bumped FastPathStrongRelationLocks */
-	bool		lockCleared;	/* we read all sinval msgs for lock */
 	int			numLockOwners;	/* # of relevant ResourceOwners */
 	int			maxLockOwners;	/* allocated size of array */
 	LOCALLOCKOWNER *lockOwners; /* dynamically resizable array */
+	bool		holdsStrongLockCount;	/* bumped FastPathStrongRelationLocks */
+	bool		lockCleared;	/* we read all sinval msgs for lock */
 } LOCALLOCK;
 
 #define LOCALLOCK_LOCKMETHOD(llock) ((llock).tag.lock.locktag_lockmethodid)

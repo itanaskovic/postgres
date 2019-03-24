@@ -4,7 +4,7 @@
  *	  support for the POSTGRES executor module
  *
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/executor/executor.h
@@ -15,6 +15,7 @@
 #define EXECUTOR_H
 
 #include "executor/execdesc.h"
+#include "nodes/lockoptions.h"
 #include "nodes/parsenodes.h"
 #include "utils/memutils.h"
 
@@ -86,7 +87,7 @@ extern PGDLLIMPORT ExecutorCheckPerms_hook_type ExecutorCheckPerms_hook;
 /*
  * prototypes from functions in execAmi.c
  */
-struct Path;					/* avoid including relation.h here */
+struct Path;					/* avoid including pathnodes.h here */
 
 extern void ExecReScan(PlanState *node);
 extern void ExecMarkPos(PlanState *node);
@@ -108,19 +109,31 @@ extern bool execCurrentOf(CurrentOfExpr *cexpr,
  */
 extern ExprState *execTuplesMatchPrepare(TupleDesc desc,
 					   int numCols,
-					   AttrNumber *keyColIdx,
-					   Oid *eqOperators,
+					   const AttrNumber *keyColIdx,
+					   const Oid *eqOperators,
+					   const Oid *collations,
 					   PlanState *parent);
 extern void execTuplesHashPrepare(int numCols,
-					  Oid *eqOperators,
+					  const Oid *eqOperators,
 					  Oid **eqFuncOids,
 					  FmgrInfo **hashFunctions);
 extern TupleHashTable BuildTupleHashTable(PlanState *parent,
 					TupleDesc inputDesc,
 					int numCols, AttrNumber *keyColIdx,
-					Oid *eqfuncoids,
+					const Oid *eqfuncoids,
 					FmgrInfo *hashfunctions,
+					Oid *collations,
 					long nbuckets, Size additionalsize,
+					MemoryContext tablecxt,
+					MemoryContext tempcxt, bool use_variable_hash_iv);
+extern TupleHashTable BuildTupleHashTableExt(PlanState *parent,
+					TupleDesc inputDesc,
+					int numCols, AttrNumber *keyColIdx,
+					const Oid *eqfuncoids,
+					FmgrInfo *hashfunctions,
+					Oid *collations,
+					long nbuckets, Size additionalsize,
+					MemoryContext metacxt,
 					MemoryContext tablecxt,
 					MemoryContext tempcxt, bool use_variable_hash_iv);
 extern TupleHashEntry LookupTupleHashEntry(TupleHashTable hashtable,
@@ -130,6 +143,7 @@ extern TupleHashEntry FindTupleHashEntry(TupleHashTable hashtable,
 				   TupleTableSlot *slot,
 				   ExprState *eqcomp,
 				   FmgrInfo *hashfunctions);
+extern void ResetTupleHashTable(TupleHashTable hashtable);
 
 /*
  * prototypes from functions in execJunk.c
@@ -184,18 +198,13 @@ extern LockTupleMode ExecUpdateLockMode(EState *estate, ResultRelInfo *relinfo);
 extern ExecRowMark *ExecFindRowMark(EState *estate, Index rti, bool missing_ok);
 extern ExecAuxRowMark *ExecBuildAuxRowMark(ExecRowMark *erm, List *targetlist);
 extern TupleTableSlot *EvalPlanQual(EState *estate, EPQState *epqstate,
-			 Relation relation, Index rti, int lockmode,
-			 ItemPointer tid, TransactionId priorXmax);
-extern HeapTuple EvalPlanQualFetch(EState *estate, Relation relation,
-				  int lockmode, LockWaitPolicy wait_policy, ItemPointer tid,
-				  TransactionId priorXmax);
+			 Relation relation, Index rti, TupleTableSlot *testslot);
 extern void EvalPlanQualInit(EPQState *epqstate, EState *estate,
 				 Plan *subplan, List *auxrowmarks, int epqParam);
 extern void EvalPlanQualSetPlan(EPQState *epqstate,
 					Plan *subplan, List *auxrowmarks);
-extern void EvalPlanQualSetTuple(EPQState *epqstate, Index rti,
-					 HeapTuple tuple);
-extern HeapTuple EvalPlanQualGetTuple(EPQState *epqstate, Index rti);
+extern TupleTableSlot *EvalPlanQualSlot(EPQState *epqstate,
+			 Relation relation, Index rti);
 
 #define EvalPlanQualSetSlot(epqstate, slot)  ((epqstate)->origslot = (slot))
 extern void EvalPlanQualFetchRowMarks(EPQState *epqstate);
@@ -244,8 +253,9 @@ extern ExprState *ExecBuildAggTrans(AggState *aggstate, struct AggStatePerPhaseD
 extern ExprState *ExecBuildGroupingEqual(TupleDesc ldesc, TupleDesc rdesc,
 					   const TupleTableSlotOps *lops, const TupleTableSlotOps *rops,
 					   int numCols,
-					   AttrNumber *keyColIdx,
-					   Oid *eqfunctions,
+					   const AttrNumber *keyColIdx,
+					   const Oid *eqfunctions,
+					   const Oid *collations,
 					   PlanState *parent);
 extern ProjectionInfo *ExecBuildProjectionInfo(List *targetList,
 						ExprContext *econtext,
@@ -549,14 +559,17 @@ extern Datum GetAttributeByNum(HeapTupleHeader tuple, AttrNumber attrno,
 extern int	ExecTargetListLength(List *targetlist);
 extern int	ExecCleanTargetListLength(List *targetlist);
 
+extern TupleTableSlot *ExecGetTriggerOldSlot(EState *estate, ResultRelInfo *relInfo);
+extern TupleTableSlot *ExecGetTriggerNewSlot(EState *estate, ResultRelInfo *relInfo);
+extern TupleTableSlot *ExecGetReturningSlot(EState *estate, ResultRelInfo *relInfo);
+
 /*
  * prototypes from functions in execIndexing.c
  */
 extern void ExecOpenIndices(ResultRelInfo *resultRelInfo, bool speculative);
 extern void ExecCloseIndices(ResultRelInfo *resultRelInfo);
-extern List *ExecInsertIndexTuples(TupleTableSlot *slot, ItemPointer tupleid,
-					  EState *estate, bool noDupErr, bool *specConflict,
-					  List *arbiterIndexes);
+extern List *ExecInsertIndexTuples(TupleTableSlot *slot, EState *estate, bool noDupErr,
+					  bool *specConflict, List *arbiterIndexes);
 extern bool ExecCheckIndexConstraints(TupleTableSlot *slot, EState *estate,
 						  ItemPointer conflictTid, List *arbiterIndexes);
 extern void check_exclusion_constraint(Relation heap, Relation index,

@@ -4,7 +4,7 @@
  *	  prototypes for nodeHash.c
  *
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/executor/nodeHash.h
@@ -24,7 +24,7 @@ extern Node *MultiExecHash(HashState *node);
 extern void ExecEndHash(HashState *node);
 extern void ExecReScanHash(HashState *node);
 
-extern HashJoinTable ExecHashTableCreate(HashState *state, List *hashOperators,
+extern HashJoinTable ExecHashTableCreate(HashState *state, List *hashOperators, List *hashCollations,
 					bool keepNulls);
 extern void ExecParallelHashTableAlloc(HashJoinTable hashtable,
 						   int batchno);

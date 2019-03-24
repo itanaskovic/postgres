@@ -4,7 +4,7 @@
  *	  definition of the "aggregate" system catalog (pg_aggregate)
  *
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/catalog/pg_aggregate.h
@@ -142,6 +142,7 @@ typedef FormData_pg_aggregate *Form_pg_aggregate;
 
 extern ObjectAddress AggregateCreate(const char *aggName,
 				Oid aggNamespace,
+				bool replace,
 				char aggKind,
 				int numArgs,
 				int numDirectArgs,

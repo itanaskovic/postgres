@@ -3,7 +3,7 @@
  * lsyscache.c
  *	  Convenience routines for common queries in the system catalog cache.
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -908,6 +908,22 @@ get_collation_name(Oid colloid)
 		return NULL;
 }
 
+bool
+get_collation_isdeterministic(Oid colloid)
+{
+	HeapTuple	tp;
+	Form_pg_collation colltup;
+	bool		result;
+
+	tp = SearchSysCache1(COLLOID, ObjectIdGetDatum(colloid));
+	if (!HeapTupleIsValid(tp))
+		elog(ERROR, "cache lookup failed for collation %u", colloid);
+	colltup = (Form_pg_collation) GETSTRUCT(tp);
+	result = colltup->collisdeterministic;
+	ReleaseSysCache(tp);
+	return result;
+}
+
 /*				---------- CONSTRAINT CACHE ----------					 */
 
 /*
@@ -1605,41 +1621,28 @@ get_func_leakproof(Oid funcid)
 }
 
 /*
- * get_func_cost
- *		Given procedure id, return the function's procost field.
+ * get_func_support
+ *
+ *		Returns the support function OID associated with a given function,
+ *		or InvalidOid if there is none.
  */
-float4
-get_func_cost(Oid funcid)
+RegProcedure
+get_func_support(Oid funcid)
 {
 	HeapTuple	tp;
-	float4		result;
 
 	tp = SearchSysCache1(PROCOID, ObjectIdGetDatum(funcid));
-	if (!HeapTupleIsValid(tp))
-		elog(ERROR, "cache lookup failed for function %u", funcid);
+	if (HeapTupleIsValid(tp))
+	{
+		Form_pg_proc functup = (Form_pg_proc) GETSTRUCT(tp);
+		RegProcedure result;
 
-	result = ((Form_pg_proc) GETSTRUCT(tp))->procost;
-	ReleaseSysCache(tp);
-	return result;
-}
-
-/*
- * get_func_rows
- *		Given procedure id, return the function's prorows field.
- */
-float4
-get_func_rows(Oid funcid)
-{
-	HeapTuple	tp;
-	float4		result;
-
-	tp = SearchSysCache1(PROCOID, ObjectIdGetDatum(funcid));
-	if (!HeapTupleIsValid(tp))
-		elog(ERROR, "cache lookup failed for function %u", funcid);
-
-	result = ((Form_pg_proc) GETSTRUCT(tp))->prorows;
-	ReleaseSysCache(tp);
-	return result;
+		result = functup->prosupport;
+		ReleaseSysCache(tp);
+		return result;
+	}
+	else
+		return (RegProcedure) InvalidOid;
 }
 
 /*				---------- RELATION CACHE ----------					 */

@@ -3,7 +3,7 @@
  * lsyscache.h
  *	  Convenience routines for common queries in the system catalog cache.
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/utils/lsyscache.h
@@ -90,6 +90,7 @@ extern Oid	get_atttype(Oid relid, AttrNumber attnum);
 extern void get_atttypetypmodcoll(Oid relid, AttrNumber attnum,
 					  Oid *typid, int32 *typmod, Oid *collid);
 extern char *get_collation_name(Oid colloid);
+extern bool get_collation_isdeterministic(Oid colloid);
 extern char *get_constraint_name(Oid conoid);
 extern char *get_language_name(Oid langoid, bool missing_ok);
 extern Oid	get_opclass_family(Oid opclass);
@@ -120,8 +121,7 @@ extern char func_volatile(Oid funcid);
 extern char func_parallel(Oid funcid);
 extern char get_func_prokind(Oid funcid);
 extern bool get_func_leakproof(Oid funcid);
-extern float4 get_func_cost(Oid funcid);
-extern float4 get_func_rows(Oid funcid);
+extern RegProcedure get_func_support(Oid funcid);
 extern Oid	get_relname_relid(const char *relname, Oid relnamespace);
 extern char *get_rel_name(Oid relid);
 extern Oid	get_rel_namespace(Oid relid);

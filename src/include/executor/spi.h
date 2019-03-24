@@ -3,7 +3,7 @@
  * spi.h
  *				Server Programming Interface public declarations
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/executor/spi.h
@@ -160,7 +160,9 @@ extern int	SPI_register_trigger_data(TriggerData *tdata);
 
 extern void SPI_start_transaction(void);
 extern void SPI_commit(void);
+extern void SPI_commit_and_chain(void);
 extern void SPI_rollback(void);
+extern void SPI_rollback_and_chain(void);
 
 extern void SPICleanup(void);
 extern void AtEOXact_SPI(bool isCommit);

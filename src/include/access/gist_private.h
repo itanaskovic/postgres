@@ -4,7 +4,7 @@
  *	  private declarations for GiST -- declarations related to the
  *	  internal implementation of GiST, not the public API
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/access/gist_private.h
@@ -78,7 +78,9 @@ typedef struct GISTSTATE
 	MemoryContext scanCxt;		/* context for scan-lifespan data */
 	MemoryContext tempCxt;		/* short-term context for calling functions */
 
-	TupleDesc	tupdesc;		/* index's tuple descriptor */
+	TupleDesc	leafTupdesc;	/* index's tuple descriptor */
+	TupleDesc	nonLeafTupdesc; /* truncated tuple descriptor for non-leaf
+								 * pages */
 	TupleDesc	fetchTupdesc;	/* tuple descriptor for tuples returned in an
 								 * index-only scan */
 
@@ -240,6 +242,7 @@ typedef struct GistSplitVector
 typedef struct
 {
 	Relation	r;
+	Relation	heapRel;
 	Size		freespace;		/* free space to be left */
 
 	GISTInsertStack *stack;
@@ -389,7 +392,8 @@ extern void freeGISTstate(GISTSTATE *giststate);
 extern void gistdoinsert(Relation r,
 			 IndexTuple itup,
 			 Size freespace,
-			 GISTSTATE *GISTstate);
+			 GISTSTATE *GISTstate,
+			 Relation heapRel);
 
 /* A List of these is returned from gistplacetopage() in *splitinfo */
 typedef struct
@@ -404,15 +408,27 @@ extern bool gistplacetopage(Relation rel, Size freespace, GISTSTATE *giststate,
 				OffsetNumber oldoffnum, BlockNumber *newblkno,
 				Buffer leftchildbuf,
 				List **splitinfo,
-				bool markleftchild);
+				bool markleftchild,
+				Relation heapRel);
 
 extern SplitedPageLayout *gistSplit(Relation r, Page page, IndexTuple *itup,
 		  int len, GISTSTATE *giststate);
+
+/* gistxlog.c */
+extern XLogRecPtr gistXLogPageDelete(Buffer buffer,
+				   TransactionId xid, Buffer parentBuffer,
+				   OffsetNumber downlinkOffset);
+
+extern void gistXLogPageReuse(Relation rel, BlockNumber blkno,
+				  TransactionId latestRemovedXid);
 
 extern XLogRecPtr gistXLogUpdate(Buffer buffer,
 			   OffsetNumber *todelete, int ntodelete,
 			   IndexTuple *itup, int ntup,
 			   Buffer leftchild);
+
+extern XLogRecPtr gistXLogDelete(Buffer buffer, OffsetNumber *todelete,
+			   int ntodelete, RelFileNode hnode);
 
 extern XLogRecPtr gistXLogSplit(bool page_is_leaf,
 			  SplitedPageLayout *dist,
@@ -443,6 +459,7 @@ extern bool gistfitpage(IndexTuple *itvec, int len);
 extern bool gistnospace(Page page, IndexTuple *itvec, int len, OffsetNumber todelete, Size freespace);
 extern void gistcheckpage(Relation rel, Buffer buf);
 extern Buffer gistNewBuffer(Relation r);
+extern bool gistPageRecyclable(Page page);
 extern void gistfillbuffer(Page page, IndexTuple *itup, int len,
 			   OffsetNumber off);
 extern IndexTuple *gistextractpage(Page page, int *len /* out */ );

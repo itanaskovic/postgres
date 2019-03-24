@@ -11,7 +11,7 @@
  * be handled easily in a simple depth-first traversal.
  *
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -24,8 +24,8 @@
 
 #include "miscadmin.h"
 #include "nodes/extensible.h"
+#include "nodes/pathnodes.h"
 #include "nodes/plannodes.h"
-#include "nodes/relation.h"
 #include "utils/datum.h"
 #include "utils/rel.h"
 
@@ -297,6 +297,7 @@ _copyRecursiveUnion(const RecursiveUnion *from)
 	{
 		COPY_POINTER_FIELD(dupColIdx, from->numCols * sizeof(AttrNumber));
 		COPY_POINTER_FIELD(dupOperators, from->numCols * sizeof(Oid));
+		COPY_POINTER_FIELD(dupCollations, from->numCols * sizeof(Oid));
 	}
 	COPY_SCALAR_FIELD(numGroups);
 
@@ -956,6 +957,7 @@ _copyGroup(const Group *from)
 	COPY_SCALAR_FIELD(numCols);
 	COPY_POINTER_FIELD(grpColIdx, from->numCols * sizeof(AttrNumber));
 	COPY_POINTER_FIELD(grpOperators, from->numCols * sizeof(Oid));
+	COPY_POINTER_FIELD(grpCollations, from->numCols * sizeof(Oid));
 
 	return newnode;
 }
@@ -977,6 +979,7 @@ _copyAgg(const Agg *from)
 	{
 		COPY_POINTER_FIELD(grpColIdx, from->numCols * sizeof(AttrNumber));
 		COPY_POINTER_FIELD(grpOperators, from->numCols * sizeof(Oid));
+		COPY_POINTER_FIELD(grpCollations, from->numCols * sizeof(Oid));
 	}
 	COPY_SCALAR_FIELD(numGroups);
 	COPY_BITMAPSET_FIELD(aggParams);
@@ -1002,12 +1005,14 @@ _copyWindowAgg(const WindowAgg *from)
 	{
 		COPY_POINTER_FIELD(partColIdx, from->partNumCols * sizeof(AttrNumber));
 		COPY_POINTER_FIELD(partOperators, from->partNumCols * sizeof(Oid));
+		COPY_POINTER_FIELD(partCollations, from->partNumCols * sizeof(Oid));
 	}
 	COPY_SCALAR_FIELD(ordNumCols);
 	if (from->ordNumCols > 0)
 	{
 		COPY_POINTER_FIELD(ordColIdx, from->ordNumCols * sizeof(AttrNumber));
 		COPY_POINTER_FIELD(ordOperators, from->ordNumCols * sizeof(Oid));
+		COPY_POINTER_FIELD(ordCollations, from->ordNumCols * sizeof(Oid));
 	}
 	COPY_SCALAR_FIELD(frameOptions);
 	COPY_NODE_FIELD(startOffset);
@@ -1040,6 +1045,7 @@ _copyUnique(const Unique *from)
 	COPY_SCALAR_FIELD(numCols);
 	COPY_POINTER_FIELD(uniqColIdx, from->numCols * sizeof(AttrNumber));
 	COPY_POINTER_FIELD(uniqOperators, from->numCols * sizeof(Oid));
+	COPY_POINTER_FIELD(uniqCollations, from->numCols * sizeof(Oid));
 
 	return newnode;
 }
@@ -1089,6 +1095,7 @@ _copySetOp(const SetOp *from)
 	COPY_SCALAR_FIELD(numCols);
 	COPY_POINTER_FIELD(dupColIdx, from->numCols * sizeof(AttrNumber));
 	COPY_POINTER_FIELD(dupOperators, from->numCols * sizeof(Oid));
+	COPY_POINTER_FIELD(dupCollations, from->numCols * sizeof(Oid));
 	COPY_SCALAR_FIELD(flagColIdx);
 	COPY_SCALAR_FIELD(firstFlag);
 	COPY_SCALAR_FIELD(numGroups);
@@ -1197,6 +1204,7 @@ _copyPartitionedRelPruneInfo(const PartitionedRelPruneInfo *from)
 	COPY_SCALAR_FIELD(nexprs);
 	COPY_POINTER_FIELD(subplan_map, from->nparts * sizeof(int));
 	COPY_POINTER_FIELD(subpart_map, from->nparts * sizeof(int));
+	COPY_POINTER_FIELD(relid_map, from->nparts * sizeof(int));
 	COPY_POINTER_FIELD(hasexecparam, from->nexprs * sizeof(bool));
 	COPY_SCALAR_FIELD(do_initial_prune);
 	COPY_SCALAR_FIELD(do_exec_prune);
@@ -1324,6 +1332,7 @@ _copyIntoClause(const IntoClause *from)
 
 	COPY_NODE_FIELD(rel);
 	COPY_NODE_FIELD(colNames);
+	COPY_STRING_FIELD(accessMethod);
 	COPY_NODE_FIELD(options);
 	COPY_SCALAR_FIELD(onCommit);
 	COPY_STRING_FIELD(tableSpaceName);
@@ -1486,14 +1495,14 @@ _copyWindowFunc(const WindowFunc *from)
 }
 
 /*
- * _copyArrayRef
+ * _copySubscriptingRef
  */
-static ArrayRef *
-_copyArrayRef(const ArrayRef *from)
+static SubscriptingRef *
+_copySubscriptingRef(const SubscriptingRef *from)
 {
-	ArrayRef   *newnode = makeNode(ArrayRef);
+	SubscriptingRef *newnode = makeNode(SubscriptingRef);
 
-	COPY_SCALAR_FIELD(refarraytype);
+	COPY_SCALAR_FIELD(refcontainertype);
 	COPY_SCALAR_FIELD(refelemtype);
 	COPY_SCALAR_FIELD(reftypmod);
 	COPY_SCALAR_FIELD(refcollid);
@@ -2196,7 +2205,7 @@ _copyOnConflictExpr(const OnConflictExpr *from)
 }
 
 /* ****************************************************************
- *						relation.h copy functions
+ *						pathnodes.h copy functions
  *
  * We don't support copying RelOptInfo, IndexOptInfo, or Path nodes.
  * There are some subsidiary structs that are useful to copy, though.
@@ -2536,6 +2545,7 @@ _copyCommonTableExpr(const CommonTableExpr *from)
 
 	COPY_STRING_FIELD(ctename);
 	COPY_NODE_FIELD(aliascolnames);
+	COPY_SCALAR_FIELD(ctematerialized);
 	COPY_NODE_FIELD(ctequery);
 	COPY_LOCATION_FIELD(location);
 	COPY_SCALAR_FIELD(cterecursive);
@@ -3309,6 +3319,7 @@ _copyCopyStmt(const CopyStmt *from)
 	COPY_SCALAR_FIELD(is_program);
 	COPY_STRING_FIELD(filename);
 	COPY_NODE_FIELD(options);
+	COPY_NODE_FIELD(whereClause);
 
 	return newnode;
 }
@@ -3332,6 +3343,7 @@ CopyCreateStmtFields(const CreateStmt *from, CreateStmt *newnode)
 	COPY_NODE_FIELD(options);
 	COPY_SCALAR_FIELD(oncommit);
 	COPY_STRING_FIELD(tablespacename);
+	COPY_STRING_FIELD(accessMethod);
 	COPY_SCALAR_FIELD(if_not_exists);
 }
 
@@ -3367,6 +3379,7 @@ _copyDefineStmt(const DefineStmt *from)
 	COPY_NODE_FIELD(args);
 	COPY_NODE_FIELD(definition);
 	COPY_SCALAR_FIELD(if_not_exists);
+	COPY_SCALAR_FIELD(replace);
 
 	return newnode;
 }
@@ -3442,7 +3455,6 @@ _copyIndexStmt(const IndexStmt *from)
 
 	COPY_STRING_FIELD(idxname);
 	COPY_NODE_FIELD(relation);
-	COPY_SCALAR_FIELD(relationId);
 	COPY_STRING_FIELD(accessMethod);
 	COPY_STRING_FIELD(tableSpace);
 	COPY_NODE_FIELD(indexParams);
@@ -3654,6 +3666,7 @@ _copyTransactionStmt(const TransactionStmt *from)
 	COPY_NODE_FIELD(options);
 	COPY_STRING_FIELD(savepoint_name);
 	COPY_STRING_FIELD(gid);
+	COPY_SCALAR_FIELD(chain);
 
 	return newnode;
 }
@@ -3847,8 +3860,9 @@ _copyVacuumStmt(const VacuumStmt *from)
 {
 	VacuumStmt *newnode = makeNode(VacuumStmt);
 
-	COPY_SCALAR_FIELD(options);
+	COPY_NODE_FIELD(options);
 	COPY_NODE_FIELD(rels);
+	COPY_SCALAR_FIELD(is_vacuumcmd);
 
 	return newnode;
 }
@@ -4963,8 +4977,8 @@ copyObjectImpl(const void *from)
 		case T_WindowFunc:
 			retval = _copyWindowFunc(from);
 			break;
-		case T_ArrayRef:
-			retval = _copyArrayRef(from);
+		case T_SubscriptingRef:
+			retval = _copySubscriptingRef(from);
 			break;
 		case T_FuncExpr:
 			retval = _copyFuncExpr(from);

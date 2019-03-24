@@ -4,7 +4,7 @@
  *	  This file contains routines to support creation of toast tables
  *
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -14,9 +14,11 @@
  */
 #include "postgres.h"
 
+#include "access/heapam.h"
 #include "access/tuptoaster.h"
 #include "access/xact.h"
 #include "catalog/binary_upgrade.h"
+#include "catalog/catalog.h"
 #include "catalog/dependency.h"
 #include "catalog/heap.h"
 #include "catalog/index.h"
@@ -78,12 +80,12 @@ CheckAndCreateToastTable(Oid relOid, Datum reloptions, LOCKMODE lockmode, bool c
 {
 	Relation	rel;
 
-	rel = heap_open(relOid, lockmode);
+	rel = table_open(relOid, lockmode);
 
 	/* create_toast_table does all the work */
 	(void) create_toast_table(rel, InvalidOid, InvalidOid, reloptions, lockmode, check);
 
-	heap_close(rel, NoLock);
+	table_close(rel, NoLock);
 }
 
 /*
@@ -96,7 +98,7 @@ BootstrapToastTable(char *relName, Oid toastOid, Oid toastIndexOid)
 {
 	Relation	rel;
 
-	rel = heap_openrv(makeRangeVar(NULL, relName, -1), AccessExclusiveLock);
+	rel = table_openrv(makeRangeVar(NULL, relName, -1), AccessExclusiveLock);
 
 	if (rel->rd_rel->relkind != RELKIND_RELATION &&
 		rel->rd_rel->relkind != RELKIND_MATVIEW)
@@ -111,7 +113,7 @@ BootstrapToastTable(char *relName, Oid toastOid, Oid toastIndexOid)
 		elog(ERROR, "\"%s\" does not require a toast table",
 			 relName);
 
-	heap_close(rel, NoLock);
+	table_close(rel, NoLock);
 }
 
 
@@ -144,21 +146,6 @@ create_toast_table(Relation rel, Oid toastOid, Oid toastIndexOid,
 	int16		coloptions[2];
 	ObjectAddress baseobject,
 				toastobject;
-
-	/*
-	 * Toast table is shared if and only if its parent is.
-	 *
-	 * We cannot allow toasting a shared relation after initdb (because
-	 * there's no way to mark it toasted in other databases' pg_class).
-	 */
-	shared_relation = rel->rd_rel->relisshared;
-	if (shared_relation && !IsBootstrapProcessingMode())
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("shared tables cannot be toasted after initdb")));
-
-	/* It's mapped if and only if its parent is, too */
-	mapped_relation = RelationIsMapped(rel);
 
 	/*
 	 * Is it already toasted?
@@ -259,6 +246,12 @@ create_toast_table(Relation rel, Oid toastOid, Oid toastIndexOid,
 		binary_upgrade_next_toast_pg_type_oid = InvalidOid;
 	}
 
+	/* Toast table is shared if and only if its parent is. */
+	shared_relation = rel->rd_rel->relisshared;
+
+	/* It's mapped if and only if its parent is, too */
+	mapped_relation = RelationIsMapped(rel);
+
 	toast_relid = heap_create_with_catalog(toast_relname,
 										   namespaceid,
 										   rel->rd_rel->reltablespace,
@@ -266,6 +259,7 @@ create_toast_table(Relation rel, Oid toastOid, Oid toastIndexOid,
 										   toast_typid,
 										   InvalidOid,
 										   rel->rd_rel->relowner,
+										   rel->rd_rel->relam,
 										   tupdesc,
 										   NIL,
 										   RELKIND_TOASTVALUE,
@@ -281,11 +275,11 @@ create_toast_table(Relation rel, Oid toastOid, Oid toastIndexOid,
 										   NULL);
 	Assert(toast_relid != InvalidOid);
 
-	/* make the toast relation visible, else heap_open will fail */
+	/* make the toast relation visible, else table_open will fail */
 	CommandCounterIncrement();
 
 	/* ShareLock is not really needed here, but take it anyway */
-	toast_rel = heap_open(toast_relid, ShareLock);
+	toast_rel = table_open(toast_relid, ShareLock);
 
 	/*
 	 * Create unique index on chunk_id, chunk_seq.
@@ -338,12 +332,12 @@ create_toast_table(Relation rel, Oid toastOid, Oid toastIndexOid,
 				 collationObjectId, classObjectId, coloptions, (Datum) 0,
 				 INDEX_CREATE_IS_PRIMARY, 0, true, true, NULL);
 
-	heap_close(toast_rel, NoLock);
+	table_close(toast_rel, NoLock);
 
 	/*
 	 * Store the toast table's OID in the parent relation's pg_class row
 	 */
-	class_rel = heap_open(RelationRelationId, RowExclusiveLock);
+	class_rel = table_open(RelationRelationId, RowExclusiveLock);
 
 	reltup = SearchSysCacheCopy1(RELOID, ObjectIdGetDatum(relOid));
 	if (!HeapTupleIsValid(reltup))
@@ -364,7 +358,7 @@ create_toast_table(Relation rel, Oid toastOid, Oid toastIndexOid,
 
 	heap_freetuple(reltup);
 
-	heap_close(class_rel, RowExclusiveLock);
+	table_close(class_rel, RowExclusiveLock);
 
 	/*
 	 * Register dependency from the toast table to the master, so that the
@@ -396,7 +390,6 @@ create_toast_table(Relation rel, Oid toastOid, Oid toastIndexOid,
  * (1) there are any toastable attributes, and (2) the maximum length
  * of a tuple could exceed TOAST_TUPLE_THRESHOLD.  (We don't want to
  * create a toast table for something like "f1 varchar(20)".)
- * No need to create a TOAST table for partitioned tables.
  */
 static bool
 needs_toast_table(Relation rel)
@@ -408,7 +401,26 @@ needs_toast_table(Relation rel)
 	int32		tuple_length;
 	int			i;
 
+	/*
+	 * No need to create a TOAST table for partitioned tables.
+	 */
 	if (rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
+		return false;
+
+	/*
+	 * We cannot allow toasting a shared relation after initdb (because
+	 * there's no way to mark it toasted in other databases' pg_class).
+	 */
+	if (rel->rd_rel->relisshared && !IsBootstrapProcessingMode())
+		return false;
+
+	/*
+	 * Ignore attempts to create toast tables on catalog tables after initdb.
+	 * Which catalogs get toast tables is explicitly chosen in
+	 * catalog/toasting.h.  (We could get here via some ALTER TABLE command if
+	 * the catalog doesn't have a toast table.)
+	 */
+	if (IsCatalogRelation(rel) && !IsBootstrapProcessingMode())
 		return false;
 
 	tupdesc = rel->rd_att;

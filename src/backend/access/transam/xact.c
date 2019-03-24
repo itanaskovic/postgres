@@ -5,7 +5,7 @@
  *
  * See src/backend/access/transam/README for more information.
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -48,6 +48,7 @@
 #include "replication/walsender.h"
 #include "storage/condition_variable.h"
 #include "storage/fd.h"
+#include "storage/freespace.h"
 #include "storage/lmgr.h"
 #include "storage/predicate.h"
 #include "storage/proc.h"
@@ -189,6 +190,7 @@ typedef struct TransactionStateData
 	bool		startedInRecovery;	/* did we start in recovery? */
 	bool		didLogXid;		/* has xid been included in WAL record? */
 	int			parallelModeLevel;	/* Enter/ExitParallelMode counter */
+	bool		chain;			/* start a new block after this one */
 	struct TransactionStateData *parent;	/* back link to parent */
 } TransactionStateData;
 
@@ -774,10 +776,10 @@ TransactionIdIsCurrentTransactionId(TransactionId xid)
 	 * We always say that BootstrapTransactionId is "not my transaction ID"
 	 * even when it is (ie, during bootstrap).  Along with the fact that
 	 * transam.c always treats BootstrapTransactionId as already committed,
-	 * this causes the tqual.c routines to see all tuples as committed, which
-	 * is what we need during bootstrap.  (Bootstrap mode only inserts tuples,
-	 * it never updates or deletes them, so all tuples can be presumed good
-	 * immediately.)
+	 * this causes the heapam_visibility.c routines to see all tuples as
+	 * committed, which is what we need during bootstrap.  (Bootstrap mode
+	 * only inserts tuples, it never updates or deletes them, so all tuples
+	 * can be presumed good immediately.)
 	 *
 	 * Likewise, InvalidTransactionId and FrozenTransactionId are certainly
 	 * not my transaction ID, so we can just return "false" immediately for
@@ -2023,9 +2025,12 @@ CommitTransaction(void)
 	/*
 	 * Mark serializable transaction as complete for predicate locking
 	 * purposes.  This should be done as late as we can put it and still allow
-	 * errors to be raised for failure patterns found at commit.
+	 * errors to be raised for failure patterns found at commit.  This is not
+	 * appropriate in a parallel worker however, because we aren't committing
+	 * the leader's transaction and its serializable state will live on.
 	 */
-	PreCommit_CheckForSerializationFailure();
+	if (!is_parallel_worker)
+		PreCommit_CheckForSerializationFailure();
 
 	/*
 	 * Insert notifications sent by NOTIFY commands into the queue.  This
@@ -2266,6 +2271,11 @@ PrepareTransaction(void)
 	 * clean up the source backend's local buffers and ON COMMIT state if the
 	 * prepared xact includes a DROP of a temp table.
 	 *
+	 * Other objects types, like functions, operators or extensions, share the
+	 * same restriction as they should not be created, locked or dropped as
+	 * this can mess up with this session or even a follow-up session trying
+	 * to use the same temporary namespace.
+	 *
 	 * We must check this after executing any ON COMMIT actions, because they
 	 * might still access a temp relation.
 	 *
@@ -2273,10 +2283,10 @@ PrepareTransaction(void)
 	 * cases, such as a temp table created and dropped all within the
 	 * transaction.  That seems to require much more bookkeeping though.
 	 */
-	if ((MyXactFlags & XACT_FLAGS_ACCESSEDTEMPREL))
+	if ((MyXactFlags & XACT_FLAGS_ACCESSEDTEMPNAMESPACE))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("cannot PREPARE a transaction that has operated on temporary tables")));
+				 errmsg("cannot PREPARE a transaction that has operated on temporary objects")));
 
 	/*
 	 * Likewise, don't allow PREPARE after pg_export_snapshot.  This could be
@@ -2487,6 +2497,12 @@ AbortTransaction(void)
 	/* Clear wait information and command progress indicator */
 	pgstat_report_wait_end();
 	pgstat_progress_end_command();
+
+	/*
+	 * In case we aborted during RelationGetBufferForTuple(), clear the local
+	 * map of heap pages.
+	 */
+	FSMClearLocalMap();
 
 	/* Clean up buffer I/O and buffer context locks, too */
 	AbortBufferIO();
@@ -2760,6 +2776,36 @@ StartTransactionCommand(void)
 	MemoryContextSwitchTo(CurTransactionContext);
 }
 
+
+/*
+ * Simple system for saving and restoring transaction characteristics
+ * (isolation level, read only, deferrable).  We need this for transaction
+ * chaining, so that we can set the characteristics of the new transaction to
+ * be the same as the previous one.  (We need something like this because the
+ * GUC system resets the characteristics at transaction end, so for example
+ * just skipping the reset in StartTransaction() won't work.)
+ */
+static int	save_XactIsoLevel;
+static bool	save_XactReadOnly;
+static bool	save_XactDeferrable;
+
+void
+SaveTransactionCharacteristics(void)
+{
+	save_XactIsoLevel = XactIsoLevel;
+	save_XactReadOnly = XactReadOnly;
+	save_XactDeferrable = XactDeferrable;
+}
+
+void
+RestoreTransactionCharacteristics(void)
+{
+	XactIsoLevel = save_XactIsoLevel;
+	XactReadOnly = save_XactReadOnly;
+	XactDeferrable = save_XactDeferrable;
+}
+
+
 /*
  *	CommitTransactionCommand
  */
@@ -2767,6 +2813,9 @@ void
 CommitTransactionCommand(void)
 {
 	TransactionState s = CurrentTransactionState;
+
+	if (s->chain)
+		SaveTransactionCharacteristics();
 
 	switch (s->blockState)
 	{
@@ -2819,6 +2868,13 @@ CommitTransactionCommand(void)
 		case TBLOCK_END:
 			CommitTransaction();
 			s->blockState = TBLOCK_DEFAULT;
+			if (s->chain)
+			{
+				StartTransaction();
+				s->blockState = TBLOCK_INPROGRESS;
+				s->chain = false;
+				RestoreTransactionCharacteristics();
+			}
 			break;
 
 			/*
@@ -2838,6 +2894,13 @@ CommitTransactionCommand(void)
 		case TBLOCK_ABORT_END:
 			CleanupTransaction();
 			s->blockState = TBLOCK_DEFAULT;
+			if (s->chain)
+			{
+				StartTransaction();
+				s->blockState = TBLOCK_INPROGRESS;
+				s->chain = false;
+				RestoreTransactionCharacteristics();
+			}
 			break;
 
 			/*
@@ -2849,6 +2912,13 @@ CommitTransactionCommand(void)
 			AbortTransaction();
 			CleanupTransaction();
 			s->blockState = TBLOCK_DEFAULT;
+			if (s->chain)
+			{
+				StartTransaction();
+				s->blockState = TBLOCK_INPROGRESS;
+				s->chain = false;
+				RestoreTransactionCharacteristics();
+			}
 			break;
 
 			/*
@@ -3506,7 +3576,7 @@ PrepareTransactionBlock(const char *gid)
 	bool		result;
 
 	/* Set up to commit the current transaction */
-	result = EndTransactionBlock();
+	result = EndTransactionBlock(false);
 
 	/* If successful, change outer tblock state to PREPARE */
 	if (result)
@@ -3552,7 +3622,7 @@ PrepareTransactionBlock(const char *gid)
  * resource owner, etc while executing inside a Portal.
  */
 bool
-EndTransactionBlock(void)
+EndTransactionBlock(bool chain)
 {
 	TransactionState s = CurrentTransactionState;
 	bool		result = false;
@@ -3678,6 +3748,13 @@ EndTransactionBlock(void)
 			break;
 	}
 
+	Assert(s->blockState == TBLOCK_STARTED ||
+		   s->blockState == TBLOCK_END ||
+		   s->blockState == TBLOCK_ABORT_END ||
+		   s->blockState == TBLOCK_ABORT_PENDING);
+
+	s->chain = chain;
+
 	return result;
 }
 
@@ -3688,7 +3765,7 @@ EndTransactionBlock(void)
  * As above, we don't actually do anything here except change blockState.
  */
 void
-UserAbortTransactionBlock(void)
+UserAbortTransactionBlock(bool chain)
 {
 	TransactionState s = CurrentTransactionState;
 
@@ -3786,6 +3863,11 @@ UserAbortTransactionBlock(void)
 				 BlockStateAsString(s->blockState));
 			break;
 	}
+
+	Assert(s->blockState == TBLOCK_ABORT_END ||
+		   s->blockState == TBLOCK_ABORT_PENDING);
+
+	s->chain = chain;
 }
 
 /*
@@ -4709,6 +4791,13 @@ AbortSubTransaction(void)
 
 	pgstat_report_wait_end();
 	pgstat_progress_end_command();
+
+	/*
+	 * In case we aborted during RelationGetBufferForTuple(), clear the local
+	 * map of heap pages.
+	 */
+	FSMClearLocalMap();
+
 	AbortBufferIO();
 	UnlockBuffers();
 
@@ -5390,7 +5479,7 @@ XactLogCommitRecord(TimestampTz commit_time,
 	{
 		XLogRegisterData((char *) (&xl_twophase), sizeof(xl_xact_twophase));
 		if (xl_xinfo.xinfo & XACT_XINFO_HAS_GID)
-			XLogRegisterData((char *) twophase_gid, strlen(twophase_gid) + 1);
+			XLogRegisterData(unconstify(char *, twophase_gid), strlen(twophase_gid) + 1);
 	}
 
 	if (xl_xinfo.xinfo & XACT_XINFO_HAS_ORIGIN)
@@ -5518,7 +5607,7 @@ XactLogAbortRecord(TimestampTz abort_time,
 	{
 		XLogRegisterData((char *) (&xl_twophase), sizeof(xl_xact_twophase));
 		if (xl_xinfo.xinfo & XACT_XINFO_HAS_GID)
-			XLogRegisterData((char *) twophase_gid, strlen(twophase_gid) + 1);
+			XLogRegisterData(unconstify(char *, twophase_gid), strlen(twophase_gid) + 1);
 	}
 
 	if (xl_xinfo.xinfo & XACT_XINFO_HAS_ORIGIN)

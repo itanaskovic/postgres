@@ -4,7 +4,7 @@
  *
  * src/include/utils/pg_locale.h
  *
- * Copyright (c) 2002-2018, PostgreSQL Global Development Group
+ * Copyright (c) 2002-2019, PostgreSQL Global Development Group
  *
  *-----------------------------------------------------------------------
  */
@@ -82,6 +82,7 @@ extern void cache_locale_time(void);
 struct pg_locale_struct
 {
 	char		provider;
+	bool		deterministic;
 	union
 	{
 #ifdef HAVE_LOCALE_T

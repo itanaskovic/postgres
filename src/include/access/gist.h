@@ -6,7 +6,7 @@
  *	  changes should be made with care.
  *
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/access/gist.h
@@ -150,6 +150,10 @@ typedef struct GISTENTRY
 
 #define GistPageGetNSN(page) ( PageXLogRecPtrGet(GistPageGetOpaque(page)->nsn))
 #define GistPageSetNSN(page, val) ( PageXLogRecPtrSet(GistPageGetOpaque(page)->nsn, val))
+
+/* For deleted pages we store last xid which could see the page in scan */
+#define GistPageGetDeleteXid(page) ( ((PageHeader) (page))->pd_prune_xid )
+#define GistPageSetDeleteXid(page, val) ( ((PageHeader) (page))->pd_prune_xid = val)
 
 /*
  * Vector of GISTENTRY structs; user-defined methods union and picksplit

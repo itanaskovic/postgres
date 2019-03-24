@@ -3,7 +3,7 @@
  * analyze.c
  *	  the Postgres statistics generator
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -16,8 +16,12 @@
 
 #include <math.h>
 
+#include "access/genam.h"
+#include "access/heapam.h"
 #include "access/multixact.h"
+#include "access/relation.h"
 #include "access/sysattr.h"
+#include "access/table.h"
 #include "access/transam.h"
 #include "access/tupconvert.h"
 #include "access/tuptoaster.h"
@@ -60,7 +64,6 @@
 #include "utils/sortsupport.h"
 #include "utils/syscache.h"
 #include "utils/timestamp.h"
-#include "utils/tqual.h"
 
 
 /* Per-index data for ANALYZE */
@@ -81,7 +84,7 @@ static MemoryContext anl_context = NULL;
 static BufferAccessStrategy vac_strategy;
 
 
-static void do_analyze_rel(Relation onerel, int options,
+static void do_analyze_rel(Relation onerel,
 			   VacuumParams *params, List *va_cols,
 			   AcquireSampleRowsFunc acquirefunc, BlockNumber relpages,
 			   bool inh, bool in_outer_xact, int elevel);
@@ -112,7 +115,7 @@ static Datum ind_fetch_func(VacAttrStatsP stats, int rownum, bool *isNull);
  * use it once we've successfully opened the rel, since it might be stale.
  */
 void
-analyze_rel(Oid relid, RangeVar *relation, int options,
+analyze_rel(Oid relid, RangeVar *relation,
 			VacuumParams *params, List *va_cols, bool in_outer_xact,
 			BufferAccessStrategy bstrategy)
 {
@@ -122,7 +125,7 @@ analyze_rel(Oid relid, RangeVar *relation, int options,
 	BlockNumber relpages = 0;
 
 	/* Select logging level */
-	if (options & VACOPT_VERBOSE)
+	if (params->options & VACOPT_VERBOSE)
 		elevel = INFO;
 	else
 		elevel = DEBUG2;
@@ -144,8 +147,8 @@ analyze_rel(Oid relid, RangeVar *relation, int options,
 	 *
 	 * Make sure to generate only logs for ANALYZE in this case.
 	 */
-	onerel = vacuum_open_relation(relid, relation, params,
-								  options & ~(VACOPT_VACUUM),
+	onerel = vacuum_open_relation(relid, relation, params->options & ~(VACOPT_VACUUM),
+								  params->log_min_duration >= 0,
 								  ShareUpdateExclusiveLock);
 
 	/* leave if relation could not be opened or locked */
@@ -162,7 +165,7 @@ analyze_rel(Oid relid, RangeVar *relation, int options,
 	 */
 	if (!vacuum_is_relation_owner(RelationGetRelid(onerel),
 								  onerel->rd_rel,
-								  options & VACOPT_ANALYZE))
+								  params->options & VACOPT_ANALYZE))
 	{
 		relation_close(onerel, ShareUpdateExclusiveLock);
 		return;
@@ -234,7 +237,7 @@ analyze_rel(Oid relid, RangeVar *relation, int options,
 	else
 	{
 		/* No need for a WARNING if we already complained during VACUUM */
-		if (!(options & VACOPT_VACUUM))
+		if (!(params->options & VACOPT_VACUUM))
 			ereport(WARNING,
 					(errmsg("skipping \"%s\" --- cannot analyze non-tables or special system tables",
 							RelationGetRelationName(onerel))));
@@ -254,14 +257,14 @@ analyze_rel(Oid relid, RangeVar *relation, int options,
 	 * tables, which don't contain any rows.
 	 */
 	if (onerel->rd_rel->relkind != RELKIND_PARTITIONED_TABLE)
-		do_analyze_rel(onerel, options, params, va_cols, acquirefunc,
+		do_analyze_rel(onerel, params, va_cols, acquirefunc,
 					   relpages, false, in_outer_xact, elevel);
 
 	/*
 	 * If there are child tables, do recursive ANALYZE.
 	 */
 	if (onerel->rd_rel->relhassubclass)
-		do_analyze_rel(onerel, options, params, va_cols, acquirefunc, relpages,
+		do_analyze_rel(onerel, params, va_cols, acquirefunc, relpages,
 					   true, in_outer_xact, elevel);
 
 	/*
@@ -289,7 +292,7 @@ analyze_rel(Oid relid, RangeVar *relation, int options,
  * appropriate acquirefunc for each child table.
  */
 static void
-do_analyze_rel(Relation onerel, int options, VacuumParams *params,
+do_analyze_rel(Relation onerel, VacuumParams *params,
 			   List *va_cols, AcquireSampleRowsFunc acquirefunc,
 			   BlockNumber relpages, bool inh, bool in_outer_xact,
 			   int elevel)
@@ -600,7 +603,7 @@ do_analyze_rel(Relation onerel, int options, VacuumParams *params,
 	 * VACUUM ANALYZE, don't overwrite the accurate count already inserted by
 	 * VACUUM.
 	 */
-	if (!inh && !(options & VACOPT_VACUUM))
+	if (!inh && !(params->options & VACOPT_VACUUM))
 	{
 		for (ind = 0; ind < nindexes; ind++)
 		{
@@ -631,7 +634,7 @@ do_analyze_rel(Relation onerel, int options, VacuumParams *params,
 							  (va_cols == NIL));
 
 	/* If this isn't part of VACUUM ANALYZE, let index AMs do cleanup */
-	if (!(options & VACOPT_VACUUM))
+	if (!(params->options & VACOPT_VACUUM))
 	{
 		for (ind = 0; ind < nindexes; ind++)
 		{
@@ -1124,20 +1127,35 @@ acquire_sample_rows(Relation onerel, int elevel,
 				case HEAPTUPLE_DELETE_IN_PROGRESS:
 
 					/*
-					 * We count delete-in-progress rows as still live, using
-					 * the same reasoning given above; but we don't bother to
-					 * include them in the sample.
+					 * We count and sample delete-in-progress rows the same as
+					 * live ones, so that the stats counters come out right if
+					 * the deleting transaction commits after us, per the same
+					 * reasoning given above.
 					 *
 					 * If the delete was done by our own transaction, however,
 					 * we must count the row as dead to make
 					 * pgstat_report_analyze's stats adjustments come out
 					 * right.  (Note: this works out properly when the row was
 					 * both inserted and deleted in our xact.)
+					 *
+					 * The net effect of these choices is that we act as
+					 * though an IN_PROGRESS transaction hasn't happened yet,
+					 * except if it is our own transaction, which we assume
+					 * has happened.
+					 *
+					 * This approach ensures that we behave sanely if we see
+					 * both the pre-image and post-image rows for a row being
+					 * updated by a concurrent transaction: we will sample the
+					 * pre-image but not the post-image.  We also get sane
+					 * results if the concurrent transaction never commits.
 					 */
 					if (TransactionIdIsCurrentTransactionId(HeapTupleHeaderGetUpdateXid(targtuple.t_data)))
 						deadrows += 1;
 					else
+					{
+						sample_it = true;
 						liverows += 1;
+					}
 					break;
 
 				default:
@@ -1334,14 +1352,14 @@ acquire_inherited_sample_rows(Relation onerel, int elevel,
 		BlockNumber relpages = 0;
 
 		/* We already got the needed lock */
-		childrel = heap_open(childOID, NoLock);
+		childrel = table_open(childOID, NoLock);
 
 		/* Ignore if temp table of another backend */
 		if (RELATION_IS_OTHER_TEMP(childrel))
 		{
 			/* ... but release the lock on it */
 			Assert(childrel != onerel);
-			heap_close(childrel, AccessShareLock);
+			table_close(childrel, AccessShareLock);
 			continue;
 		}
 
@@ -1373,7 +1391,7 @@ acquire_inherited_sample_rows(Relation onerel, int elevel,
 			{
 				/* ignore, but release the lock on it */
 				Assert(childrel != onerel);
-				heap_close(childrel, AccessShareLock);
+				table_close(childrel, AccessShareLock);
 				continue;
 			}
 		}
@@ -1385,9 +1403,9 @@ acquire_inherited_sample_rows(Relation onerel, int elevel,
 			 */
 			Assert(childrel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE);
 			if (childrel != onerel)
-				heap_close(childrel, AccessShareLock);
+				table_close(childrel, AccessShareLock);
 			else
-				heap_close(childrel, NoLock);
+				table_close(childrel, NoLock);
 			continue;
 		}
 
@@ -1483,7 +1501,7 @@ acquire_inherited_sample_rows(Relation onerel, int elevel,
 		 * Note: we cannot release the child-table locks, since we may have
 		 * pointers to their TOAST tables in the sampled rows.
 		 */
-		heap_close(childrel, NoLock);
+		table_close(childrel, NoLock);
 	}
 
 	return numrows;
@@ -1521,7 +1539,7 @@ update_attstats(Oid relid, bool inh, int natts, VacAttrStats **vacattrstats)
 	if (natts <= 0)
 		return;					/* nothing to do */
 
-	sd = heap_open(StatisticRelationId, RowExclusiveLock);
+	sd = table_open(StatisticRelationId, RowExclusiveLock);
 
 	for (attno = 0; attno < natts; attno++)
 	{
@@ -1642,7 +1660,7 @@ update_attstats(Oid relid, bool inh, int natts, VacAttrStats **vacattrstats)
 		heap_freetuple(stup);
 	}
 
-	heap_close(sd, RowExclusiveLock);
+	table_close(sd, RowExclusiveLock);
 }
 
 /*

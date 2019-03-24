@@ -4,7 +4,7 @@
  *
  *	Parallel support for pg_dump and pg_restore
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -225,8 +225,6 @@ static char *readMessageFromPipe(int fd);
 
 #define messageStartsWith(msg, prefix) \
 	(strncmp(msg, prefix, strlen(prefix)) == 0)
-#define messageEquals(msg, pattern) \
-	(strcmp(msg, pattern) == 0)
 
 
 /*

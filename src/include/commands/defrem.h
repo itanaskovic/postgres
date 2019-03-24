@@ -4,7 +4,7 @@
  *	  POSTGRES define and remove utility definitions.
  *
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/commands/defrem.h
@@ -94,7 +94,7 @@ extern void UpdateStatisticsForTypeChange(Oid statsOid,
 
 /* commands/aggregatecmds.c */
 extern ObjectAddress DefineAggregate(ParseState *pstate, List *name, List *args, bool oldstyle,
-				List *parameters);
+									 List *parameters, bool replace);
 
 /* commands/opclasscmds.c */
 extern ObjectAddress DefineOpClass(CreateOpClassStmt *stmt);

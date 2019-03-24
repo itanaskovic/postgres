@@ -157,7 +157,10 @@ alter event trigger regress_event_trigger rename to regress_event_trigger3;
 drop event trigger regress_event_trigger;
 
 -- should fail, regress_evt_user owns some objects
+-- use terse mode to avoid ordering issues in DROP ROLE detail output
+\set VERBOSITY terse
 drop role regress_evt_user;
+\set VERBOSITY default
 
 -- cleanup before next test
 -- these are all OK; the second one should emit a NOTICE
@@ -329,7 +332,7 @@ $$;
 create event trigger no_rewrite_allowed on table_rewrite
   execute procedure test_evtrig_no_rewrite();
 
-create table rewriteme (id serial primary key, foo float);
+create table rewriteme (id serial primary key, foo float, bar timestamptz);
 insert into rewriteme
      select x * 1.001 from generate_series(1, 500) as t(x);
 alter table rewriteme alter column foo type numeric;
@@ -352,6 +355,14 @@ alter table rewriteme
 
 -- shouldn't trigger a table_rewrite event
 alter table rewriteme alter column foo type numeric(12,4);
+begin;
+set timezone to 'UTC';
+alter table rewriteme alter column bar type timestamp;
+set timezone to '0';
+alter table rewriteme alter column bar type timestamptz;
+set timezone to 'Europe/London';
+alter table rewriteme alter column bar type timestamp; -- does rewrite
+rollback;
 
 -- typed tables are rewritten when their type changes.  Don't emit table
 -- name, because firing order is not stable.

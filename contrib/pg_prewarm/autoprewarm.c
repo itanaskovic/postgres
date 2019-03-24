@@ -16,7 +16,7 @@
  *		relevant database in turn.  The former keeps running after the
  *		initial prewarm is complete to update the dump file periodically.
  *
- *	Copyright (c) 2016-2018, PostgreSQL Global Development Group
+ *	Copyright (c) 2016-2019, PostgreSQL Global Development Group
  *
  *	IDENTIFICATION
  *		contrib/pg_prewarm/autoprewarm.c
@@ -28,7 +28,7 @@
 
 #include <unistd.h>
 
-#include "access/heapam.h"
+#include "access/relation.h"
 #include "access/xact.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_type.h"
@@ -840,6 +840,7 @@ apw_start_database_worker(void)
 	worker.bgw_flags =
 		BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
 	worker.bgw_start_time = BgWorkerStart_ConsistentState;
+	worker.bgw_restart_time = BGW_NEVER_RESTART;
 	strcpy(worker.bgw_library_name, "pg_prewarm");
 	strcpy(worker.bgw_function_name, "autoprewarm_database_main");
 	strcpy(worker.bgw_name, "autoprewarm worker");

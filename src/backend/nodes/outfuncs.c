@@ -3,7 +3,7 @@
  * outfuncs.c
  *	  Output functions for Postgres tree nodes.
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -32,8 +32,8 @@
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
 #include "nodes/extensible.h"
+#include "nodes/pathnodes.h"
 #include "nodes/plannodes.h"
-#include "nodes/relation.h"
 #include "utils/datum.h"
 #include "utils/rel.h"
 
@@ -109,6 +109,34 @@ static void outChar(StringInfo str, char c);
 #define WRITE_BITMAPSET_FIELD(fldname) \
 	(appendStringInfoString(str, " :" CppAsString(fldname) " "), \
 	 outBitmapset(str, node->fldname))
+
+#define WRITE_ATTRNUMBER_ARRAY(fldname, len) \
+	do { \
+		appendStringInfoString(str, " :" CppAsString(fldname) " "); \
+		for (int i = 0; i < len; i++) \
+			appendStringInfo(str, " %d", node->fldname[i]); \
+	} while(0)
+
+#define WRITE_OID_ARRAY(fldname, len) \
+	do { \
+		appendStringInfoString(str, " :" CppAsString(fldname) " "); \
+		for (int i = 0; i < len; i++) \
+			appendStringInfo(str, " %u", node->fldname[i]); \
+	} while(0)
+
+#define WRITE_INT_ARRAY(fldname, len) \
+	do { \
+		appendStringInfoString(str, " :" CppAsString(fldname) " "); \
+		for (int i = 0; i < len; i++) \
+			appendStringInfo(str, " %d", node->fldname[i]); \
+	} while(0)
+
+#define WRITE_BOOL_ARRAY(fldname, len) \
+	do { \
+		appendStringInfoString(str, " :" CppAsString(fldname) " "); \
+		for (int i = 0; i < len; i++) \
+			appendStringInfo(str, " %s", booltostr(node->fldname[i])); \
+	} while(0)
 
 
 #define booltostr(x)  ((x) ? "true" : "false")
@@ -411,55 +439,31 @@ _outAppend(StringInfo str, const Append *node)
 static void
 _outMergeAppend(StringInfo str, const MergeAppend *node)
 {
-	int			i;
-
 	WRITE_NODE_TYPE("MERGEAPPEND");
 
 	_outPlanInfo(str, (const Plan *) node);
 
 	WRITE_NODE_FIELD(mergeplans);
-
 	WRITE_INT_FIELD(numCols);
-
-	appendStringInfoString(str, " :sortColIdx");
-	for (i = 0; i < node->numCols; i++)
-		appendStringInfo(str, " %d", node->sortColIdx[i]);
-
-	appendStringInfoString(str, " :sortOperators");
-	for (i = 0; i < node->numCols; i++)
-		appendStringInfo(str, " %u", node->sortOperators[i]);
-
-	appendStringInfoString(str, " :collations");
-	for (i = 0; i < node->numCols; i++)
-		appendStringInfo(str, " %u", node->collations[i]);
-
-	appendStringInfoString(str, " :nullsFirst");
-	for (i = 0; i < node->numCols; i++)
-		appendStringInfo(str, " %s", booltostr(node->nullsFirst[i]));
-
+	WRITE_ATTRNUMBER_ARRAY(sortColIdx, node->numCols);
+	WRITE_OID_ARRAY(sortOperators, node->numCols);
+	WRITE_OID_ARRAY(collations, node->numCols);
+	WRITE_BOOL_ARRAY(nullsFirst, node->numCols);
 	WRITE_NODE_FIELD(part_prune_info);
 }
 
 static void
 _outRecursiveUnion(StringInfo str, const RecursiveUnion *node)
 {
-	int			i;
-
 	WRITE_NODE_TYPE("RECURSIVEUNION");
 
 	_outPlanInfo(str, (const Plan *) node);
 
 	WRITE_INT_FIELD(wtParam);
 	WRITE_INT_FIELD(numCols);
-
-	appendStringInfoString(str, " :dupColIdx");
-	for (i = 0; i < node->numCols; i++)
-		appendStringInfo(str, " %d", node->dupColIdx[i]);
-
-	appendStringInfoString(str, " :dupOperators");
-	for (i = 0; i < node->numCols; i++)
-		appendStringInfo(str, " %u", node->dupOperators[i]);
-
+	WRITE_ATTRNUMBER_ARRAY(dupColIdx, node->numCols);
+	WRITE_OID_ARRAY(dupOperators, node->numCols);
+	WRITE_OID_ARRAY(dupCollations, node->numCols);
 	WRITE_LONG_FIELD(numGroups);
 }
 
@@ -501,8 +505,6 @@ _outGather(StringInfo str, const Gather *node)
 static void
 _outGatherMerge(StringInfo str, const GatherMerge *node)
 {
-	int			i;
-
 	WRITE_NODE_TYPE("GATHERMERGE");
 
 	_outPlanInfo(str, (const Plan *) node);
@@ -510,23 +512,10 @@ _outGatherMerge(StringInfo str, const GatherMerge *node)
 	WRITE_INT_FIELD(num_workers);
 	WRITE_INT_FIELD(rescan_param);
 	WRITE_INT_FIELD(numCols);
-
-	appendStringInfoString(str, " :sortColIdx");
-	for (i = 0; i < node->numCols; i++)
-		appendStringInfo(str, " %d", node->sortColIdx[i]);
-
-	appendStringInfoString(str, " :sortOperators");
-	for (i = 0; i < node->numCols; i++)
-		appendStringInfo(str, " %u", node->sortOperators[i]);
-
-	appendStringInfoString(str, " :collations");
-	for (i = 0; i < node->numCols; i++)
-		appendStringInfo(str, " %u", node->collations[i]);
-
-	appendStringInfoString(str, " :nullsFirst");
-	for (i = 0; i < node->numCols; i++)
-		appendStringInfo(str, " %s", booltostr(node->nullsFirst[i]));
-
+	WRITE_ATTRNUMBER_ARRAY(sortColIdx, node->numCols);
+	WRITE_OID_ARRAY(sortOperators, node->numCols);
+	WRITE_OID_ARRAY(collations, node->numCols);
+	WRITE_BOOL_ARRAY(nullsFirst, node->numCols);
 	WRITE_BITMAPSET_FIELD(initParam);
 }
 
@@ -748,7 +737,6 @@ static void
 _outMergeJoin(StringInfo str, const MergeJoin *node)
 {
 	int			numCols;
-	int			i;
 
 	WRITE_NODE_TYPE("MERGEJOIN");
 
@@ -759,21 +747,10 @@ _outMergeJoin(StringInfo str, const MergeJoin *node)
 
 	numCols = list_length(node->mergeclauses);
 
-	appendStringInfoString(str, " :mergeFamilies");
-	for (i = 0; i < numCols; i++)
-		appendStringInfo(str, " %u", node->mergeFamilies[i]);
-
-	appendStringInfoString(str, " :mergeCollations");
-	for (i = 0; i < numCols; i++)
-		appendStringInfo(str, " %u", node->mergeCollations[i]);
-
-	appendStringInfoString(str, " :mergeStrategies");
-	for (i = 0; i < numCols; i++)
-		appendStringInfo(str, " %d", node->mergeStrategies[i]);
-
-	appendStringInfoString(str, " :mergeNullsFirst");
-	for (i = 0; i < numCols; i++)
-		appendStringInfo(str, " %s", booltostr(node->mergeNullsFirst[i]));
+	WRITE_OID_ARRAY(mergeFamilies, numCols);
+	WRITE_OID_ARRAY(mergeCollations, numCols);
+	WRITE_INT_ARRAY(mergeStrategies, numCols);
+	WRITE_BOOL_ARRAY(mergeNullsFirst, numCols);
 }
 
 static void
@@ -789,8 +766,6 @@ _outHashJoin(StringInfo str, const HashJoin *node)
 static void
 _outAgg(StringInfo str, const Agg *node)
 {
-	int			i;
-
 	WRITE_NODE_TYPE("AGG");
 
 	_outPlanInfo(str, (const Plan *) node);
@@ -798,15 +773,9 @@ _outAgg(StringInfo str, const Agg *node)
 	WRITE_ENUM_FIELD(aggstrategy, AggStrategy);
 	WRITE_ENUM_FIELD(aggsplit, AggSplit);
 	WRITE_INT_FIELD(numCols);
-
-	appendStringInfoString(str, " :grpColIdx");
-	for (i = 0; i < node->numCols; i++)
-		appendStringInfo(str, " %d", node->grpColIdx[i]);
-
-	appendStringInfoString(str, " :grpOperators");
-	for (i = 0; i < node->numCols; i++)
-		appendStringInfo(str, " %u", node->grpOperators[i]);
-
+	WRITE_ATTRNUMBER_ARRAY(grpColIdx, node->numCols);
+	WRITE_OID_ARRAY(grpOperators, node->numCols);
+	WRITE_OID_ARRAY(grpCollations, node->numCols);
 	WRITE_LONG_FIELD(numGroups);
 	WRITE_BITMAPSET_FIELD(aggParams);
 	WRITE_NODE_FIELD(groupingSets);
@@ -816,33 +785,19 @@ _outAgg(StringInfo str, const Agg *node)
 static void
 _outWindowAgg(StringInfo str, const WindowAgg *node)
 {
-	int			i;
-
 	WRITE_NODE_TYPE("WINDOWAGG");
 
 	_outPlanInfo(str, (const Plan *) node);
 
 	WRITE_UINT_FIELD(winref);
 	WRITE_INT_FIELD(partNumCols);
-
-	appendStringInfoString(str, " :partColIdx");
-	for (i = 0; i < node->partNumCols; i++)
-		appendStringInfo(str, " %d", node->partColIdx[i]);
-
-	appendStringInfoString(str, " :partOperations");
-	for (i = 0; i < node->partNumCols; i++)
-		appendStringInfo(str, " %u", node->partOperators[i]);
-
+	WRITE_ATTRNUMBER_ARRAY(partColIdx, node->partNumCols);
+	WRITE_OID_ARRAY(partOperators, node->partNumCols);
+	WRITE_OID_ARRAY(partCollations, node->partNumCols);
 	WRITE_INT_FIELD(ordNumCols);
-
-	appendStringInfoString(str, " :ordColIdx");
-	for (i = 0; i < node->ordNumCols; i++)
-		appendStringInfo(str, " %d", node->ordColIdx[i]);
-
-	appendStringInfoString(str, " :ordOperations");
-	for (i = 0; i < node->ordNumCols; i++)
-		appendStringInfo(str, " %u", node->ordOperators[i]);
-
+	WRITE_ATTRNUMBER_ARRAY(ordColIdx, node->ordNumCols);
+	WRITE_OID_ARRAY(ordOperators, node->ordNumCols);
+	WRITE_OID_ARRAY(ordCollations, node->ordNumCols);
 	WRITE_INT_FIELD(frameOptions);
 	WRITE_NODE_FIELD(startOffset);
 	WRITE_NODE_FIELD(endOffset);
@@ -856,21 +811,14 @@ _outWindowAgg(StringInfo str, const WindowAgg *node)
 static void
 _outGroup(StringInfo str, const Group *node)
 {
-	int			i;
-
 	WRITE_NODE_TYPE("GROUP");
 
 	_outPlanInfo(str, (const Plan *) node);
 
 	WRITE_INT_FIELD(numCols);
-
-	appendStringInfoString(str, " :grpColIdx");
-	for (i = 0; i < node->numCols; i++)
-		appendStringInfo(str, " %d", node->grpColIdx[i]);
-
-	appendStringInfoString(str, " :grpOperators");
-	for (i = 0; i < node->numCols; i++)
-		appendStringInfo(str, " %u", node->grpOperators[i]);
+	WRITE_ATTRNUMBER_ARRAY(grpColIdx, node->numCols);
+	WRITE_OID_ARRAY(grpOperators, node->numCols);
+	WRITE_OID_ARRAY(grpCollations, node->numCols);
 }
 
 static void
@@ -884,49 +832,28 @@ _outMaterial(StringInfo str, const Material *node)
 static void
 _outSort(StringInfo str, const Sort *node)
 {
-	int			i;
-
 	WRITE_NODE_TYPE("SORT");
 
 	_outPlanInfo(str, (const Plan *) node);
 
 	WRITE_INT_FIELD(numCols);
-
-	appendStringInfoString(str, " :sortColIdx");
-	for (i = 0; i < node->numCols; i++)
-		appendStringInfo(str, " %d", node->sortColIdx[i]);
-
-	appendStringInfoString(str, " :sortOperators");
-	for (i = 0; i < node->numCols; i++)
-		appendStringInfo(str, " %u", node->sortOperators[i]);
-
-	appendStringInfoString(str, " :collations");
-	for (i = 0; i < node->numCols; i++)
-		appendStringInfo(str, " %u", node->collations[i]);
-
-	appendStringInfoString(str, " :nullsFirst");
-	for (i = 0; i < node->numCols; i++)
-		appendStringInfo(str, " %s", booltostr(node->nullsFirst[i]));
+	WRITE_ATTRNUMBER_ARRAY(sortColIdx, node->numCols);
+	WRITE_OID_ARRAY(sortOperators, node->numCols);
+	WRITE_OID_ARRAY(collations, node->numCols);
+	WRITE_BOOL_ARRAY(nullsFirst, node->numCols);
 }
 
 static void
 _outUnique(StringInfo str, const Unique *node)
 {
-	int			i;
-
 	WRITE_NODE_TYPE("UNIQUE");
 
 	_outPlanInfo(str, (const Plan *) node);
 
 	WRITE_INT_FIELD(numCols);
-
-	appendStringInfoString(str, " :uniqColIdx");
-	for (i = 0; i < node->numCols; i++)
-		appendStringInfo(str, " %d", node->uniqColIdx[i]);
-
-	appendStringInfoString(str, " :uniqOperators");
-	for (i = 0; i < node->numCols; i++)
-		appendStringInfo(str, " %u", node->uniqOperators[i]);
+	WRITE_ATTRNUMBER_ARRAY(uniqColIdx, node->numCols);
+	WRITE_OID_ARRAY(uniqOperators, node->numCols);
+	WRITE_OID_ARRAY(uniqCollations, node->numCols);
 }
 
 static void
@@ -945,8 +872,6 @@ _outHash(StringInfo str, const Hash *node)
 static void
 _outSetOp(StringInfo str, const SetOp *node)
 {
-	int			i;
-
 	WRITE_NODE_TYPE("SETOP");
 
 	_outPlanInfo(str, (const Plan *) node);
@@ -954,15 +879,9 @@ _outSetOp(StringInfo str, const SetOp *node)
 	WRITE_ENUM_FIELD(cmd, SetOpCmd);
 	WRITE_ENUM_FIELD(strategy, SetOpStrategy);
 	WRITE_INT_FIELD(numCols);
-
-	appendStringInfoString(str, " :dupColIdx");
-	for (i = 0; i < node->numCols; i++)
-		appendStringInfo(str, " %d", node->dupColIdx[i]);
-
-	appendStringInfoString(str, " :dupOperators");
-	for (i = 0; i < node->numCols; i++)
-		appendStringInfo(str, " %u", node->dupOperators[i]);
-
+	WRITE_ATTRNUMBER_ARRAY(dupColIdx, node->numCols);
+	WRITE_OID_ARRAY(dupOperators, node->numCols);
+	WRITE_OID_ARRAY(dupCollations, node->numCols);
 	WRITE_INT_FIELD(flagColIdx);
 	WRITE_INT_FIELD(firstFlag);
 	WRITE_LONG_FIELD(numGroups);
@@ -1026,8 +945,6 @@ _outPartitionPruneInfo(StringInfo str, const PartitionPruneInfo *node)
 static void
 _outPartitionedRelPruneInfo(StringInfo str, const PartitionedRelPruneInfo *node)
 {
-	int			i;
-
 	WRITE_NODE_TYPE("PARTITIONEDRELPRUNEINFO");
 
 	WRITE_UINT_FIELD(rtindex);
@@ -1035,19 +952,10 @@ _outPartitionedRelPruneInfo(StringInfo str, const PartitionedRelPruneInfo *node)
 	WRITE_BITMAPSET_FIELD(present_parts);
 	WRITE_INT_FIELD(nparts);
 	WRITE_INT_FIELD(nexprs);
-
-	appendStringInfoString(str, " :subplan_map");
-	for (i = 0; i < node->nparts; i++)
-		appendStringInfo(str, " %d", node->subplan_map[i]);
-
-	appendStringInfoString(str, " :subpart_map");
-	for (i = 0; i < node->nparts; i++)
-		appendStringInfo(str, " %d", node->subpart_map[i]);
-
-	appendStringInfoString(str, " :hasexecparam");
-	for (i = 0; i < node->nexprs; i++)
-		appendStringInfo(str, " %s", booltostr(node->hasexecparam[i]));
-
+	WRITE_INT_ARRAY(subplan_map, node->nparts);
+	WRITE_INT_ARRAY(subpart_map, node->nparts);
+	WRITE_OID_ARRAY(relid_map, node->nparts);
+	WRITE_BOOL_ARRAY(hasexecparam, node->nexprs);
 	WRITE_BOOL_FIELD(do_initial_prune);
 	WRITE_BOOL_FIELD(do_exec_prune);
 	WRITE_BITMAPSET_FIELD(execparamids);
@@ -1143,6 +1051,7 @@ _outIntoClause(StringInfo str, const IntoClause *node)
 
 	WRITE_NODE_FIELD(rel);
 	WRITE_NODE_FIELD(colNames);
+	WRITE_NODE_FIELD(accessMethod);
 	WRITE_NODE_FIELD(options);
 	WRITE_ENUM_FIELD(onCommit, OnCommitAction);
 	WRITE_STRING_FIELD(tableSpaceName);
@@ -1253,11 +1162,11 @@ _outWindowFunc(StringInfo str, const WindowFunc *node)
 }
 
 static void
-_outArrayRef(StringInfo str, const ArrayRef *node)
+_outSubscriptingRef(StringInfo str, const SubscriptingRef *node)
 {
-	WRITE_NODE_TYPE("ARRAYREF");
+	WRITE_NODE_TYPE("SUBSCRIPTINGREF");
 
-	WRITE_OID_FIELD(refarraytype);
+	WRITE_OID_FIELD(refcontainertype);
 	WRITE_OID_FIELD(refelemtype);
 	WRITE_INT_FIELD(reftypmod);
 	WRITE_OID_FIELD(refcollid);
@@ -1776,7 +1685,7 @@ _outOnConflictExpr(StringInfo str, const OnConflictExpr *node)
 
 /*****************************************************************************
  *
- *	Stuff from relation.h.
+ *	Stuff from pathnodes.h.
  *
  *****************************************************************************/
 
@@ -1844,8 +1753,6 @@ _outIndexPath(StringInfo str, const IndexPath *node)
 
 	WRITE_NODE_FIELD(indexinfo);
 	WRITE_NODE_FIELD(indexclauses);
-	WRITE_NODE_FIELD(indexquals);
-	WRITE_NODE_FIELD(indexqualcols);
 	WRITE_NODE_FIELD(indexorderbys);
 	WRITE_NODE_FIELD(indexorderbycols);
 	WRITE_ENUM_FIELD(indexscandir, ScanDirection);
@@ -1955,9 +1862,9 @@ _outMergeAppendPath(StringInfo str, const MergeAppendPath *node)
 }
 
 static void
-_outResultPath(StringInfo str, const ResultPath *node)
+_outGroupResultPath(StringInfo str, const GroupResultPath *node)
 {
-	WRITE_NODE_TYPE("RESULTPATH");
+	WRITE_NODE_TYPE("GROUPRESULTPATH");
 
 	_outPathInfo(str, (const Path *) node);
 
@@ -2313,7 +2220,6 @@ _outPlannerInfo(StringInfo str, const PlannerInfo *node)
 	WRITE_ENUM_FIELD(inhTargetKind, InheritanceKind);
 	WRITE_BOOL_FIELD(hasJoinRTEs);
 	WRITE_BOOL_FIELD(hasLateralRTEs);
-	WRITE_BOOL_FIELD(hasDeletedRTEs);
 	WRITE_BOOL_FIELD(hasHavingQual);
 	WRITE_BOOL_FIELD(hasPseudoConstantQuals);
 	WRITE_BOOL_FIELD(hasRecursion);
@@ -2409,15 +2315,9 @@ _outForeignKeyOptInfo(StringInfo str, const ForeignKeyOptInfo *node)
 	WRITE_UINT_FIELD(con_relid);
 	WRITE_UINT_FIELD(ref_relid);
 	WRITE_INT_FIELD(nkeys);
-	appendStringInfoString(str, " :conkey");
-	for (i = 0; i < node->nkeys; i++)
-		appendStringInfo(str, " %d", node->conkey[i]);
-	appendStringInfoString(str, " :confkey");
-	for (i = 0; i < node->nkeys; i++)
-		appendStringInfo(str, " %d", node->confkey[i]);
-	appendStringInfoString(str, " :conpfeqop");
-	for (i = 0; i < node->nkeys; i++)
-		appendStringInfo(str, " %u", node->conpfeqop[i]);
+	WRITE_ATTRNUMBER_ARRAY(conkey, node->nkeys);
+	WRITE_ATTRNUMBER_ARRAY(confkey, node->nkeys);
+	WRITE_OID_ARRAY(conpfeqop, node->nkeys);
 	WRITE_INT_FIELD(nmatched_ec);
 	WRITE_INT_FIELD(nmatched_rcols);
 	WRITE_INT_FIELD(nmatched_ri);
@@ -2555,6 +2455,18 @@ _outRestrictInfo(StringInfo str, const RestrictInfo *node)
 }
 
 static void
+_outIndexClause(StringInfo str, const IndexClause *node)
+{
+	WRITE_NODE_TYPE("INDEXCLAUSE");
+
+	WRITE_NODE_FIELD(rinfo);
+	WRITE_NODE_FIELD(indexquals);
+	WRITE_BOOL_FIELD(lossy);
+	WRITE_INT_FIELD(indexcol);
+	WRITE_NODE_FIELD(indexcols);
+}
+
+static void
 _outPlaceHolderVar(StringInfo str, const PlaceHolderVar *node)
 {
 	WRITE_NODE_TYPE("PLACEHOLDERVAR");
@@ -2675,6 +2587,7 @@ _outCreateStmtInfo(StringInfo str, const CreateStmt *node)
 	WRITE_NODE_FIELD(options);
 	WRITE_ENUM_FIELD(oncommit, OnCommitAction);
 	WRITE_STRING_FIELD(tablespacename);
+	WRITE_STRING_FIELD(accessMethod);
 	WRITE_BOOL_FIELD(if_not_exists);
 }
 
@@ -2717,7 +2630,6 @@ _outIndexStmt(StringInfo str, const IndexStmt *node)
 
 	WRITE_STRING_FIELD(idxname);
 	WRITE_NODE_FIELD(relation);
-	WRITE_OID_FIELD(relationId);
 	WRITE_STRING_FIELD(accessMethod);
 	WRITE_STRING_FIELD(tableSpace);
 	WRITE_NODE_FIELD(indexParams);
@@ -3087,6 +2999,7 @@ _outCommonTableExpr(StringInfo str, const CommonTableExpr *node)
 
 	WRITE_STRING_FIELD(ctename);
 	WRITE_NODE_FIELD(aliascolnames);
+	WRITE_ENUM_FIELD(ctematerialized, CTEMaterialize);
 	WRITE_NODE_FIELD(ctequery);
 	WRITE_LOCATION_FIELD(location);
 	WRITE_BOOL_FIELD(cterecursive);
@@ -3166,6 +3079,9 @@ _outRangeTblEntry(StringInfo str, const RangeTblEntry *node)
 			WRITE_NODE_FIELD(coltypes);
 			WRITE_NODE_FIELD(coltypmods);
 			WRITE_NODE_FIELD(colcollations);
+			break;
+		case RTE_RESULT:
+			/* no extra fields */
 			break;
 		default:
 			elog(ERROR, "unrecognized RTE kind: %d", (int) node->rtekind);
@@ -3629,23 +3545,15 @@ _outConstraint(StringInfo str, const Constraint *node)
 static void
 _outForeignKeyCacheInfo(StringInfo str, const ForeignKeyCacheInfo *node)
 {
-	int			i;
-
 	WRITE_NODE_TYPE("FOREIGNKEYCACHEINFO");
 
 	WRITE_OID_FIELD(conoid);
 	WRITE_OID_FIELD(conrelid);
 	WRITE_OID_FIELD(confrelid);
 	WRITE_INT_FIELD(nkeys);
-	appendStringInfoString(str, " :conkey");
-	for (i = 0; i < node->nkeys; i++)
-		appendStringInfo(str, " %d", node->conkey[i]);
-	appendStringInfoString(str, " :confkey");
-	for (i = 0; i < node->nkeys; i++)
-		appendStringInfo(str, " %d", node->confkey[i]);
-	appendStringInfoString(str, " :conpfeqop");
-	for (i = 0; i < node->nkeys; i++)
-		appendStringInfo(str, " %u", node->conpfeqop[i]);
+	WRITE_ATTRNUMBER_ARRAY(conkey, node->nkeys);
+	WRITE_ATTRNUMBER_ARRAY(confkey, node->nkeys);
+	WRITE_OID_ARRAY(conpfeqop, node->nkeys);
 }
 
 static void
@@ -3902,8 +3810,8 @@ outNode(StringInfo str, const void *obj)
 			case T_WindowFunc:
 				_outWindowFunc(str, obj);
 				break;
-			case T_ArrayRef:
-				_outArrayRef(str, obj);
+			case T_SubscriptingRef:
+				_outSubscriptingRef(str, obj);
 				break;
 			case T_FuncExpr:
 				_outFuncExpr(str, obj);
@@ -4058,8 +3966,8 @@ outNode(StringInfo str, const void *obj)
 			case T_MergeAppendPath:
 				_outMergeAppendPath(str, obj);
 				break;
-			case T_ResultPath:
-				_outResultPath(str, obj);
+			case T_GroupResultPath:
+				_outGroupResultPath(str, obj);
 				break;
 			case T_MaterialPath:
 				_outMaterialPath(str, obj);
@@ -4156,6 +4064,9 @@ outNode(StringInfo str, const void *obj)
 				break;
 			case T_RestrictInfo:
 				_outRestrictInfo(str, obj);
+				break;
+			case T_IndexClause:
+				_outIndexClause(str, obj);
 				break;
 			case T_PlaceHolderVar:
 				_outPlaceHolderVar(str, obj);

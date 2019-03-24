@@ -4,7 +4,7 @@
  *		PostgreSQL write-ahead log manager
  *
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/backend/access/transam/xlog.c
@@ -40,6 +40,7 @@
 #include "catalog/pg_control.h"
 #include "catalog/pg_database.h"
 #include "commands/tablespace.h"
+#include "common/controldata_utils.h"
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "port/atomics.h"
@@ -65,7 +66,6 @@
 #include "storage/reinit.h"
 #include "storage/smgr.h"
 #include "storage/spin.h"
-#include "utils/backend_random.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/memutils.h"
@@ -270,7 +270,7 @@ bool		recoveryTargetInclusive = true;
 int			recoveryTargetAction = RECOVERY_TARGET_ACTION_PAUSE;
 TransactionId recoveryTargetXid;
 TimestampTz recoveryTargetTime;
-char	   *recoveryTargetName;
+const char *recoveryTargetName;
 XLogRecPtr	recoveryTargetLSN;
 int			recovery_min_apply_delay = 0;
 TimestampTz recoveryDelayUntilTime;
@@ -325,7 +325,7 @@ static bool recoveryStopAfter;
  * file was created.)  During a sequential scan we do not allow this value
  * to decrease.
  */
-RecoveryTargetTimeLineGoal recoveryTargetTimeLineGoal = RECOVERY_TARGET_TIMELINE_CONTROLFILE;
+RecoveryTargetTimeLineGoal recoveryTargetTimeLineGoal = RECOVERY_TARGET_TIMELINE_LATEST;
 TimeLineID	recoveryTargetTLIRequested = 0;
 TimeLineID	recoveryTargetTLI = 0;
 static List *expectedTLEs;
@@ -772,13 +772,11 @@ static const char *xlogSourceNames[] = {"any", "archive", "pg_wal", "stream"};
 
 /*
  * openLogFile is -1 or a kernel FD for an open log file segment.
- * When it's open, openLogOff is the current seek offset in the file.
- * openLogSegNo identifies the segment.  These variables are only
- * used to write the XLOG, and so will normally refer to the active segment.
+ * openLogSegNo identifies the segment.  These variables are only used to
+ * write the XLOG, and so will normally refer to the active segment.
  */
 static int	openLogFile = -1;
 static XLogSegNo openLogSegNo = 0;
-static uint32 openLogOff = 0;
 
 /*
  * These variables are used similarly to the ones above, but for reading
@@ -2448,7 +2446,6 @@ XLogWrite(XLogwrtRqst WriteRqst, bool flexible)
 			/* create/use new log file */
 			use_existent = true;
 			openLogFile = XLogFileInit(openLogSegNo, &use_existent, true);
-			openLogOff = 0;
 		}
 
 		/* Make sure we have the current logfile open */
@@ -2457,7 +2454,6 @@ XLogWrite(XLogwrtRqst WriteRqst, bool flexible)
 			XLByteToPrevSeg(LogwrtResult.Write, openLogSegNo,
 							wal_segment_size);
 			openLogFile = XLogFileOpen(openLogSegNo);
-			openLogOff = 0;
 		}
 
 		/* Add current page to the set of pending pages-to-dump */
@@ -2509,15 +2505,13 @@ XLogWrite(XLogwrtRqst WriteRqst, bool flexible)
 							 errmsg("could not write to log file %s "
 									"at offset %u, length %zu: %m",
 									XLogFileNameP(ThisTimeLineID, openLogSegNo),
-									openLogOff, nbytes)));
+									startoffset, nleft)));
 				}
 				nleft -= written;
 				from += written;
 				startoffset += written;
 			} while (nleft > 0);
 
-			/* Update state for write */
-			openLogOff += nbytes;
 			npages = 0;
 
 			/*
@@ -2603,7 +2597,6 @@ XLogWrite(XLogwrtRqst WriteRqst, bool flexible)
 				XLByteToPrevSeg(LogwrtResult.Write, openLogSegNo,
 								wal_segment_size);
 				openLogFile = XLogFileOpen(openLogSegNo);
-				openLogOff = 0;
 			}
 
 			issue_xlog_fsync(openLogFile, openLogSegNo);
@@ -3477,7 +3470,10 @@ XLogFileCopy(XLogSegNo destsegno, TimeLineID srcTLI, XLogSegNo srcsegno,
 				(errcode_for_file_access(),
 				 errmsg("could not close file \"%s\": %m", tmppath)));
 
-	CloseTransientFile(srcfd);
+	if (CloseTransientFile(srcfd))
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not close file \"%s\": %m", path)));
 
 	/*
 	 * Now move the segment into place with its final name.
@@ -4759,51 +4755,14 @@ ReadControlFile(void)
 					PGC_INTERNAL, PGC_S_OVERRIDE);
 }
 
+/*
+ * Utility wrapper to update the control file.  Note that the control
+ * file gets flushed.
+ */
 void
 UpdateControlFile(void)
 {
-	int			fd;
-
-	INIT_CRC32C(ControlFile->crc);
-	COMP_CRC32C(ControlFile->crc,
-				(char *) ControlFile,
-				offsetof(ControlFileData, crc));
-	FIN_CRC32C(ControlFile->crc);
-
-	fd = BasicOpenFile(XLOG_CONTROL_FILE,
-					   O_RDWR | PG_BINARY);
-	if (fd < 0)
-		ereport(PANIC,
-				(errcode_for_file_access(),
-				 errmsg("could not open file \"%s\": %m", XLOG_CONTROL_FILE)));
-
-	errno = 0;
-	pgstat_report_wait_start(WAIT_EVENT_CONTROL_FILE_WRITE_UPDATE);
-	if (write(fd, ControlFile, sizeof(ControlFileData)) != sizeof(ControlFileData))
-	{
-		/* if write didn't set errno, assume problem is no disk space */
-		if (errno == 0)
-			errno = ENOSPC;
-		ereport(PANIC,
-				(errcode_for_file_access(),
-				 errmsg("could not write to file \"%s\": %m",
-						XLOG_CONTROL_FILE)));
-	}
-	pgstat_report_wait_end();
-
-	pgstat_report_wait_start(WAIT_EVENT_CONTROL_FILE_SYNC_UPDATE);
-	if (pg_fsync(fd) != 0)
-		ereport(PANIC,
-				(errcode_for_file_access(),
-				 errmsg("could not fsync file \"%s\": %m",
-						XLOG_CONTROL_FILE)));
-	pgstat_report_wait_end();
-
-	if (close(fd))
-		ereport(PANIC,
-				(errcode_for_file_access(),
-				 errmsg("could not close file \"%s\": %m",
-						XLOG_CONTROL_FILE)));
+	update_controlfile(DataDir, NULL, ControlFile, true);
 }
 
 /*
@@ -5132,7 +5091,7 @@ BootStrapXLOG(void)
 	 * a genuine-looking password challenge for the non-existent user, in lieu
 	 * of an actual stored password.
 	 */
-	if (!pg_backend_random(mock_auth_nonce, MOCK_AUTH_NONCE_LEN))
+	if (!pg_strong_random(mock_auth_nonce, MOCK_AUTH_NONCE_LEN))
 		ereport(PANIC,
 				(errcode(ERRCODE_INTERNAL_ERROR),
 				 errmsg("could not generate secret authorization token")));
@@ -5258,6 +5217,7 @@ BootStrapXLOG(void)
 	/* Set important parameter values for use when replaying WAL */
 	ControlFile->MaxConnections = MaxConnections;
 	ControlFile->max_worker_processes = max_worker_processes;
+	ControlFile->max_wal_senders = max_wal_senders;
 	ControlFile->max_prepared_xacts = max_prepared_xacts;
 	ControlFile->max_locks_per_xact = max_locks_per_xact;
 	ControlFile->wal_level = wal_level;
@@ -5327,7 +5287,8 @@ readRecoverySignalFile(void)
 
 	/*
 	 * Check for recovery signal files and if found, fsync them since they
-	 * represent server state information.
+	 * represent server state information.  We don't sweat too much about the
+	 * possibility of fsync failure, however.
 	 *
 	 * If present, standby signal file takes precedence. If neither is present
 	 * then we won't enter archive recovery.
@@ -5338,8 +5299,11 @@ readRecoverySignalFile(void)
 
 		fd = BasicOpenFilePerm(STANDBY_SIGNAL_FILE, O_RDWR | PG_BINARY | get_sync_bit(sync_method),
 							   S_IRUSR | S_IWUSR);
-		pg_fsync(fd);
-		close(fd);
+		if (fd >= 0)
+		{
+			(void) pg_fsync(fd);
+			close(fd);
+		}
 		standby_signal_file_found = true;
 	}
 	else if (stat(RECOVERY_SIGNAL_FILE, &stat_buf) == 0)
@@ -5348,8 +5312,11 @@ readRecoverySignalFile(void)
 
 		fd = BasicOpenFilePerm(RECOVERY_SIGNAL_FILE, O_RDWR | PG_BINARY | get_sync_bit(sync_method),
 							   S_IRUSR | S_IWUSR);
-		pg_fsync(fd);
-		close(fd);
+		if (fd >= 0)
+		{
+			(void) pg_fsync(fd);
+			close(fd);
+		}
 		recovery_signal_file_found = true;
 	}
 
@@ -6164,6 +6131,9 @@ CheckRequiredParameterValues(void)
 		RecoveryRequiresIntParameter("max_worker_processes",
 									 max_worker_processes,
 									 ControlFile->max_worker_processes);
+		RecoveryRequiresIntParameter("max_wal_senders",
+									 max_wal_senders,
+									 ControlFile->max_wal_senders);
 		RecoveryRequiresIntParameter("max_prepared_transactions",
 									 max_prepared_xacts,
 									 ControlFile->max_prepared_xacts);
@@ -8376,7 +8346,7 @@ LogCheckpointStart(int flags, bool restartpoint)
 		 (flags & CHECKPOINT_IMMEDIATE) ? " immediate" : "",
 		 (flags & CHECKPOINT_FORCE) ? " force" : "",
 		 (flags & CHECKPOINT_WAIT) ? " wait" : "",
-		 (flags & CHECKPOINT_CAUSE_XLOG) ? " xlog" : "",
+		 (flags & CHECKPOINT_CAUSE_XLOG) ? " wal" : "",
 		 (flags & CHECKPOINT_CAUSE_TIME) ? " time" : "",
 		 (flags & CHECKPOINT_FLUSH_ALL) ? " flush-all" : "");
 }
@@ -9454,6 +9424,7 @@ XLogReportParameters(void)
 		wal_log_hints != ControlFile->wal_log_hints ||
 		MaxConnections != ControlFile->MaxConnections ||
 		max_worker_processes != ControlFile->max_worker_processes ||
+		max_wal_senders != ControlFile->max_wal_senders ||
 		max_prepared_xacts != ControlFile->max_prepared_xacts ||
 		max_locks_per_xact != ControlFile->max_locks_per_xact ||
 		track_commit_timestamp != ControlFile->track_commit_timestamp)
@@ -9472,6 +9443,7 @@ XLogReportParameters(void)
 
 			xlrec.MaxConnections = MaxConnections;
 			xlrec.max_worker_processes = max_worker_processes;
+			xlrec.max_wal_senders = max_wal_senders;
 			xlrec.max_prepared_xacts = max_prepared_xacts;
 			xlrec.max_locks_per_xact = max_locks_per_xact;
 			xlrec.wal_level = wal_level;
@@ -9487,6 +9459,7 @@ XLogReportParameters(void)
 
 		ControlFile->MaxConnections = MaxConnections;
 		ControlFile->max_worker_processes = max_worker_processes;
+		ControlFile->max_wal_senders = max_wal_senders;
 		ControlFile->max_prepared_xacts = max_prepared_xacts;
 		ControlFile->max_locks_per_xact = max_locks_per_xact;
 		ControlFile->wal_level = wal_level;
@@ -9890,6 +9863,7 @@ xlog_redo(XLogReaderState *record)
 		LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
 		ControlFile->MaxConnections = xlrec.MaxConnections;
 		ControlFile->max_worker_processes = xlrec.max_worker_processes;
+		ControlFile->max_wal_senders = xlrec.max_wal_senders;
 		ControlFile->max_prepared_xacts = xlrec.max_prepared_xacts;
 		ControlFile->max_locks_per_xact = xlrec.max_locks_per_xact;
 		ControlFile->wal_level = xlrec.wal_level;
@@ -9921,7 +9895,7 @@ xlog_redo(XLogReaderState *record)
 		UpdateControlFile();
 		LWLockRelease(ControlFileLock);
 
-		/* Check to see if any changes to max_connections give problems */
+		/* Check to see if any parameter change gives a problem on recovery */
 		CheckRequiredParameterValues();
 	}
 	else if (info == XLOG_FPW_CHANGE)
@@ -10163,9 +10137,10 @@ XLogFileNameP(TimeLineID tli, XLogSegNo segno)
 }
 
 /*
- * do_pg_start_backup is the workhorse of the user-visible pg_start_backup()
- * function. It creates the necessary starting checkpoint and constructs the
- * backup label file.
+ * do_pg_start_backup
+ *
+ * Utility function called at the start of an online backup. It creates the
+ * necessary starting checkpoint and constructs the backup label file.
  *
  * There are two kind of backups: exclusive and non-exclusive. An exclusive
  * backup is started with pg_start_backup(), and there can be only one active
@@ -10705,8 +10680,10 @@ get_backup_status(void)
 }
 
 /*
- * do_pg_stop_backup is the workhorse of the user-visible pg_stop_backup()
- * function.
+ * do_pg_stop_backup
+ *
+ * Utility function called at the end of an online backup. It cleans up the
+ * backup state and can optionally wait for WAL segments to be archived.
  *
  * If labelfile is NULL, this stops an exclusive backup. Otherwise this stops
  * the non-exclusive backup specified by 'labelfile'.
@@ -11077,7 +11054,7 @@ do_pg_stop_backup(char *labelfile, bool waitforarchive, TimeLineID *stoptli_p)
 			if (!reported_waiting && waits > 5)
 			{
 				ereport(NOTICE,
-						(errmsg("pg_stop_backup cleanup done, waiting for required WAL segments to be archived")));
+						(errmsg("base backup done, waiting for required WAL segments to be archived")));
 				reported_waiting = true;
 			}
 
@@ -11087,16 +11064,16 @@ do_pg_stop_backup(char *labelfile, bool waitforarchive, TimeLineID *stoptli_p)
 			{
 				seconds_before_warning *= 2;	/* This wraps in >10 years... */
 				ereport(WARNING,
-						(errmsg("pg_stop_backup still waiting for all required WAL segments to be archived (%d seconds elapsed)",
+						(errmsg("still waiting for all required WAL segments to be archived (%d seconds elapsed)",
 								waits),
 						 errhint("Check that your archive_command is executing properly.  "
-								 "pg_stop_backup can be canceled safely, "
+								 "You can safely cancel this backup, "
 								 "but the database backup will not be usable without all the WAL segments.")));
 			}
 		}
 
 		ereport(NOTICE,
-				(errmsg("pg_stop_backup complete, all required WAL segments have been archived")));
+				(errmsg("all required WAL segments have been archived")));
 	}
 	else if (waitforarchive)
 		ereport(NOTICE,
@@ -12095,7 +12072,8 @@ WaitForWALToBecomeAvailable(XLogRecPtr RecPtr, bool randAccess,
 
 					/*
 					 * Wait for more WAL to arrive. Time out after 5 seconds
-					 * to react to a trigger file promptly.
+					 * to react to a trigger file promptly and to check if the
+					 * WAL receiver is still active.
 					 */
 					(void) WaitLatch(&XLogCtl->recoveryWakeupLatch,
 									 WL_LATCH_SET | WL_TIMEOUT |
