@@ -28,6 +28,9 @@ extern bool synchronize_seqscans;
 
 
 struct BulkInsertStateData;
+struct IndexInfo;
+struct IndexBuildCallback;
+struct ValidateIndexState;
 
 
 /*
@@ -105,6 +108,14 @@ typedef struct TM_FailureData
 /* Follow update chain and lock lastest version of tuple */
 #define TUPLE_LOCK_FLAG_FIND_LAST_VERSION		(1 << 1)
 
+
+/* Typedef for callback function for table_index_build_scan */
+typedef void (*IndexBuildCallback) (Relation index,
+									HeapTuple htup,
+									Datum *values,
+									bool *isnull,
+									bool tupleIsAlive,
+									void *state);
 
 /*
  * API struct for a table AM.  Note this must be allocated in a
@@ -256,9 +267,10 @@ typedef struct TableAmRoutine
 	 * needs be set to true by index_fetch_tuple, signalling to the caller
 	 * that index_fetch_tuple should be called again for the same tid.
 	 *
-	 * *all_dead should be set to true by index_fetch_tuple iff it is
-	 * guaranteed that no backend needs to see that tuple. Index AMs can use
-	 * that do avoid returning that tid in future searches.
+	 * *all_dead, if all_dead is not NULL, should be set to true if by
+	 * index_fetch_tuple iff it is guaranteed that no backend needs to see
+	 * that tuple. Index AMs can use that do avoid returning that tid in
+	 * future searches.
 	 */
 	bool		(*index_fetch_tuple) (struct IndexFetchTableData *scan,
 									  ItemPointer tid,
@@ -271,6 +283,25 @@ typedef struct TableAmRoutine
 	 * ------------------------------------------------------------------------
 	 */
 
+
+	/*
+	 * Fetch tuple at `tid` into `slot, after doing a visibility test
+	 * according to `snapshot`. If a tuple was found and passed the visibility
+	 * test, returns true, false otherwise.
+	 */
+	bool		(*tuple_fetch_row_version) (Relation rel,
+											ItemPointer tid,
+											Snapshot snapshot,
+											TupleTableSlot *slot);
+
+	/*
+	 * Return the latest version of the tuple at `tid`, by updating `tid` to
+	 * point at the newest version.
+	 */
+	void		(*tuple_get_latest_tid) (Relation rel,
+										 Snapshot snapshot,
+										 ItemPointer tid);
+
 	/*
 	 * Does the tuple in `slot` satisfy `snapshot`?  The slot needs to be of
 	 * the appropriate type for the AM.
@@ -278,6 +309,12 @@ typedef struct TableAmRoutine
 	bool		(*tuple_satisfies_snapshot) (Relation rel,
 											 TupleTableSlot *slot,
 											 Snapshot snapshot);
+
+	/* see table_compute_xid_horizon_for_tuples() */
+	TransactionId (*compute_xid_horizon_for_tuples) (Relation rel,
+													 ItemPointerData *items,
+													 int nitems);
+
 
 	/* ------------------------------------------------------------------------
 	 * Manipulations of physical tuples.
@@ -288,7 +325,7 @@ typedef struct TableAmRoutine
 	void		(*tuple_insert) (Relation rel, TupleTableSlot *slot, CommandId cid,
 								 int options, struct BulkInsertStateData *bistate);
 
-	/* see table_insert() for reference about parameters */
+	/* see table_insert_speculative() for reference about parameters */
 	void		(*tuple_insert_speculative) (Relation rel,
 											 TupleTableSlot *slot,
 											 CommandId cid,
@@ -296,13 +333,13 @@ typedef struct TableAmRoutine
 											 struct BulkInsertStateData *bistate,
 											 uint32 specToken);
 
-	/* see table_insert() for reference about parameters */
+	/* see table_complete_speculative() for reference about parameters */
 	void		(*tuple_complete_speculative) (Relation rel,
 											   TupleTableSlot *slot,
 											   uint32 specToken,
 											   bool succeeded);
 
-	/* see table_insert() for reference about parameters */
+	/* see table_delete() for reference about parameters */
 	TM_Result	(*tuple_delete) (Relation rel,
 								 ItemPointer tid,
 								 CommandId cid,
@@ -312,7 +349,7 @@ typedef struct TableAmRoutine
 								 TM_FailureData *tmfd,
 								 bool changingPart);
 
-	/* see table_insert() for reference about parameters */
+	/* see table_update() for reference about parameters */
 	TM_Result	(*tuple_update) (Relation rel,
 								 ItemPointer otid,
 								 TupleTableSlot *slot,
@@ -324,7 +361,7 @@ typedef struct TableAmRoutine
 								 LockTupleMode *lockmode,
 								 bool *update_indexes);
 
-	/* see table_insert() for reference about parameters */
+	/* see table_lock_tuple() for reference about parameters */
 	TM_Result	(*tuple_lock) (Relation rel,
 							   ItemPointer tid,
 							   Snapshot snapshot,
@@ -334,6 +371,71 @@ typedef struct TableAmRoutine
 							   LockWaitPolicy wait_policy,
 							   uint8 flags,
 							   TM_FailureData *tmfd);
+
+
+	/* ------------------------------------------------------------------------
+	 * DDL related functionality.
+	 * ------------------------------------------------------------------------
+	 */
+
+	/*
+	 * This callback needs to create a new relation filenode for `rel`, with
+	 * appropriate durability behaviour for `persistence`.
+	 *
+	 * On output *freezeXid, *minmulti should be set to the values appropriate
+	 * for pg_class.{relfrozenxid, relminmxid} have to be set to. For AMs that
+	 * don't need those fields to be filled they can be set to
+	 * InvalidTransactionId, InvalidMultiXactId respectively.
+	 *
+	 * See also table_relation_set_new_filenode().
+	 */
+	void		(*relation_set_new_filenode) (Relation rel,
+											  char persistence,
+											  TransactionId *freezeXid,
+											  MultiXactId *minmulti);
+
+	/*
+	 * This callback needs to remove all contents from `rel`'s current
+	 * relfilenode. No provisions for transactional behaviour need to be
+	 * made. Often this can be implemented by truncating the underlying
+	 * storage to its minimal size.
+	 *
+	 * See also table_relation_nontransactional_truncate().
+	 */
+	void		(*relation_nontransactional_truncate) (Relation rel);
+
+	/*
+	 * See table_relation_copy_data().
+	 *
+	 * This can typically be implemented by directly copying the underlying
+	 * storage, unless it contains references to the tablespace internally.
+	 */
+	void		(*relation_copy_data) (Relation rel, RelFileNode newrnode);
+
+	/* See table_relation_copy_for_cluster() */
+	void		(*relation_copy_for_cluster) (Relation NewHeap, Relation OldHeap, Relation OldIndex,
+											  bool use_sort,
+											  TransactionId OldestXmin, TransactionId FreezeXid, MultiXactId MultiXactCutoff,
+											  double *num_tuples, double *tups_vacuumed, double *tups_recently_dead);
+
+	/* see table_index_build_range_scan for reference about parameters */
+	double		(*index_build_range_scan) (Relation heap_rel,
+										   Relation index_rel,
+										   struct IndexInfo *index_nfo,
+										   bool allow_sync,
+										   bool anyvisible,
+										   BlockNumber start_blockno,
+										   BlockNumber end_blockno,
+										   IndexBuildCallback callback,
+										   void *callback_state,
+										   TableScanDesc scan);
+
+	/* see table_index_validate_scan for reference about parameters */
+	void		(*index_validate_scan) (Relation heap_rel,
+										Relation index_rel,
+										struct IndexInfo *index_info,
+										Snapshot snapshot,
+										struct ValidateIndexState *state);
 
 } TableAmRoutine;
 
@@ -574,18 +676,26 @@ table_index_fetch_end(struct IndexFetchTableData *scan)
 }
 
 /*
- * Fetches tuple at `tid` into `slot`, after doing a visibility test according
- * to `snapshot`. If a tuple was found and passed the visibility test, returns
- * true, false otherwise.
+ * Fetches, as part of an index scan, tuple at `tid` into `slot`, after doing
+ * a visibility test according to `snapshot`. If a tuple was found and passed
+ * the visibility test, returns true, false otherwise.
  *
  * *call_again needs to be false on the first call to table_index_fetch_tuple() for
  * a tid. If there potentially is another tuple matching the tid, *call_again
  * will be set to true, signalling that table_index_fetch_tuple() should be called
  * again for the same tid.
  *
- * *all_dead will be set to true by table_index_fetch_tuple() iff it is guaranteed
- * that no backend needs to see that tuple. Index AMs can use that do avoid
- * returning that tid in future searches.
+ * *all_dead, if all_dead is not NULL, will be set to true by
+ * table_index_fetch_tuple() iff it is guaranteed that no backend needs to see
+ * that tuple. Index AMs can use that do avoid returning that tid in future
+ * searches.
+ *
+ * The difference between this function and table_fetch_row_version is that
+ * this function returns the currently visible version of a row if the AM
+ * supports storing multiple row versions reachable via a single index entry
+ * (like heap's HOT). Whereas table_fetch_row_version only evaluates the the
+ * tuple exactly at `tid`. Outside of index entry ->table tuple lookups,
+ * table_fetch_row_version is what's usually needed.
  */
 static inline bool
 table_index_fetch_tuple(struct IndexFetchTableData *scan,
@@ -600,11 +710,51 @@ table_index_fetch_tuple(struct IndexFetchTableData *scan,
 													all_dead);
 }
 
+/*
+ * This is a convenience wrapper around table_index_fetch_tuple() which
+ * returns whether there are table tuple items corresponding to an index
+ * entry.  This likely is only useful to verify if there's a conflict in a
+ * unique index.
+ */
+extern bool table_index_fetch_tuple_check(Relation rel,
+							  ItemPointer tid,
+							  Snapshot snapshot,
+							  bool *all_dead);
+
 
 /* ------------------------------------------------------------------------
  * Functions for non-modifying operations on individual tuples
  * ------------------------------------------------------------------------
  */
+
+
+/*
+ * Fetch tuple at `tid` into `slot, after doing a visibility test according to
+ * `snapshot`. If a tuple was found and passed the visibility test, returns
+ * true, false otherwise.
+ *
+ * See table_index_fetch_tuple's comment about what the difference between
+ * these functions is. This function is the correct to use outside of
+ * index entry->table tuple lookups.
+ */
+static inline bool
+table_fetch_row_version(Relation rel,
+						ItemPointer tid,
+						Snapshot snapshot,
+						TupleTableSlot *slot)
+{
+	return rel->rd_tableam->tuple_fetch_row_version(rel, tid, snapshot, slot);
+}
+
+/*
+ * Return the latest version of the tuple at `tid`, by updating `tid` to
+ * point at the newest version.
+ */
+static inline void
+table_get_latest_tid(Relation rel, Snapshot snapshot, ItemPointer tid)
+{
+	rel->rd_tableam->tuple_get_latest_tid(rel, snapshot, tid);
+}
 
 /*
  * Return true iff tuple in slot satisfies the snapshot.
@@ -619,6 +769,19 @@ static inline bool
 table_tuple_satisfies_snapshot(Relation rel, TupleTableSlot *slot, Snapshot snapshot)
 {
 	return rel->rd_tableam->tuple_satisfies_snapshot(rel, slot, snapshot);
+}
+
+/*
+ * Compute the newest xid among the tuples pointed to by items. This is used
+ * to compute what snapshots to conflict with when replaying WAL records for
+ * page-level index vacuums.
+ */
+static inline TransactionId
+table_compute_xid_horizon_for_tuples(Relation rel,
+									 ItemPointerData *items,
+									 int nitems)
+{
+	return rel->rd_tableam->compute_xid_horizon_for_tuples(rel, items, nitems);
 }
 
 
@@ -830,6 +993,188 @@ table_lock_tuple(Relation rel, ItemPointer tid, Snapshot snapshot,
 	return rel->rd_tableam->tuple_lock(rel, tid, snapshot, slot,
 									   cid, mode, wait_policy,
 									   flags, tmfd);
+}
+
+
+/* ------------------------------------------------------------------------
+ * DDL related functionality.
+ * ------------------------------------------------------------------------
+ */
+
+/*
+ * Create a new relation filenode for `rel`, with persistence set to
+ * `persistence`.
+ *
+ * This is used both during relation creation and various DDL operations to
+ * create a new relfilenode that can be filled from scratch.
+ *
+ * *freezeXid, *minmulti are set to the xid / multixact horizon for the table
+ * that pg_class.{relfrozenxid, relminmxid} have to be set to.
+ */
+static inline void
+table_relation_set_new_filenode(Relation rel, char persistence,
+								TransactionId *freezeXid,
+								MultiXactId *minmulti)
+{
+	rel->rd_tableam->relation_set_new_filenode(rel, persistence,
+											   freezeXid, minmulti);
+}
+
+/*
+ * Remove all table contents from `rel`, in a non-transactional manner.
+ * Non-transactional meaning that there's no need to support rollbacks. This
+ * commonly only is used to perform truncations for relfilenodes created in the
+ * current transaction.
+ */
+static inline void
+table_relation_nontransactional_truncate(Relation rel)
+{
+	rel->rd_tableam->relation_nontransactional_truncate(rel);
+}
+
+/*
+ * Copy data from `rel` into the new relfilenode `newrnode`. The new
+ * relfilenode may not have storage associated before this function is
+ * called. This is only supposed to be used for low level operations like
+ * changing a relation's tablespace.
+ */
+static inline void
+table_relation_copy_data(Relation rel, RelFileNode newrnode)
+{
+	rel->rd_tableam->relation_copy_data(rel, newrnode);
+}
+
+/*
+ * Copy data from `OldHeap` into `NewHeap`, as part of a CLUSTER or VACUUM
+ * FULL.
+ *
+ * If `use_sort` is true, the table contents are sorted appropriate for
+ * `OldIndex`; if use_sort is false and OldIndex is not InvalidOid, the data
+ * is copied in that index's order; if use_sort is false and OidIndex is
+ * InvalidOid, no sorting is performed.
+ *
+ * OldestXmin, FreezeXid, MultiXactCutoff need to currently valid values for
+ * the table.
+ *
+ * *num_tuples, *tups_vacuumed, *tups_recently_dead will contain statistics
+ * computed while copying for the relation. Not all might make sense for every
+ * AM.
+ */
+static inline void
+table_relation_copy_for_cluster(Relation OldHeap, Relation NewHeap,
+								Relation OldIndex,
+								bool use_sort,
+								TransactionId OldestXmin,
+								TransactionId FreezeXid,
+								MultiXactId MultiXactCutoff,
+								double *num_tuples,
+								double *tups_vacuumed,
+								double *tups_recently_dead)
+{
+	OldHeap->rd_tableam->relation_copy_for_cluster(OldHeap, NewHeap, OldIndex,
+												   use_sort, OldestXmin,
+												   FreezeXid, MultiXactCutoff,
+												   num_tuples, tups_vacuumed,
+												   tups_recently_dead);
+}
+
+/*
+ * table_index_build_range_scan - scan the table to find tuples to be indexed
+ *
+ * This is called back from an access-method-specific index build procedure
+ * after the AM has done whatever setup it needs.  The parent heap relation
+ * is scanned to find tuples that should be entered into the index.  Each
+ * such tuple is passed to the AM's callback routine, which does the right
+ * things to add it to the new index.  After we return, the AM's index
+ * build procedure does whatever cleanup it needs.
+ *
+ * The total count of live tuples is returned.  This is for updating pg_class
+ * statistics.  (It's annoying not to be able to do that here, but we want to
+ * merge that update with others; see index_update_stats.)  Note that the
+ * index AM itself must keep track of the number of index tuples; we don't do
+ * so here because the AM might reject some of the tuples for its own reasons,
+ * such as being unable to store NULLs.
+ *
+ *
+ * A side effect is to set indexInfo->ii_BrokenHotChain to true if we detect
+ * any potentially broken HOT chains.  Currently, we set this if there are any
+ * RECENTLY_DEAD or DELETE_IN_PROGRESS entries in a HOT chain, without trying
+ * very hard to detect whether they're really incompatible with the chain tip.
+ * This only really makes sense for heap AM, it might need to be generalized
+ * for other AMs later.
+ */
+static inline double
+table_index_build_scan(Relation heap_rel,
+					   Relation index_rel,
+					   struct IndexInfo *index_nfo,
+					   bool allow_sync,
+					   IndexBuildCallback callback,
+					   void *callback_state,
+					   TableScanDesc scan)
+{
+	return heap_rel->rd_tableam->index_build_range_scan(heap_rel,
+														index_rel,
+														index_nfo,
+														allow_sync,
+														false,
+														0,
+														InvalidBlockNumber,
+														callback,
+														callback_state,
+														scan);
+}
+
+/*
+ * As table_index_build_scan(), except that instead of scanning the complete
+ * table, only the given number of blocks are scanned.  Scan to end-of-rel can
+ * be signalled by passing InvalidBlockNumber as numblocks.  Note that
+ * restricting the range to scan cannot be done when requesting syncscan.
+ *
+ * When "anyvisible" mode is requested, all tuples visible to any transaction
+ * are indexed and counted as live, including those inserted or deleted by
+ * transactions that are still in progress.
+ */
+static inline double
+table_index_build_range_scan(Relation heap_rel,
+							 Relation index_rel,
+							 struct IndexInfo *index_nfo,
+							 bool allow_sync,
+							 bool anyvisible,
+							 BlockNumber start_blockno,
+							 BlockNumber numblocks,
+							 IndexBuildCallback callback,
+							 void *callback_state,
+							 TableScanDesc scan)
+{
+	return heap_rel->rd_tableam->index_build_range_scan(heap_rel,
+														index_rel,
+														index_nfo,
+														allow_sync,
+														anyvisible,
+														start_blockno,
+														numblocks,
+														callback,
+														callback_state,
+														scan);
+}
+
+/*
+ * table_index_validate_scan - second table scan for concurrent index build
+ *
+ * See validate_index() for an explanation.
+ */
+static inline void
+table_index_validate_scan(Relation heap_rel,
+						  Relation index_rel,
+						  struct IndexInfo *index_info,
+						  Snapshot snapshot,
+						  struct ValidateIndexState *state)
+{
+	heap_rel->rd_tableam->index_validate_scan(heap_rel,
+											  index_rel,
+											  index_info,
+											  snapshot,
+											  state);
 }
 
 

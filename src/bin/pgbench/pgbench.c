@@ -490,7 +490,6 @@ typedef enum MetaCommand
 	META_SETSHELL,				/* \setshell */
 	META_SHELL,					/* \shell */
 	META_SLEEP,					/* \sleep */
-	META_CSET,					/* \cset */
 	META_GSET,					/* \gset */
 	META_IF,					/* \if */
 	META_ELIF,					/* \elif */
@@ -521,11 +520,9 @@ static const char *QUERYMODE[] = {"simple", "extended", "prepared"};
  * argv			Command arguments, the first of which is the command or SQL
  *				string itself.  For SQL commands, after post-processing
  *				argv[0] is the same as 'lines' with variables substituted.
- * nqueries		In a multi-command SQL line, the number of queries.
- * varprefix 	SQL commands terminated with \gset or \cset have this set
+ * varprefix 	SQL commands terminated with \gset have this set
  *				to a non NULL value.  If nonempty, it's used to prefix the
  *				variable name that receives the value.
- * varprefix_max Allocated size of the varprefix array.
  * expr			Parsed expression, if needed.
  * stats		Time spent in this command.
  */
@@ -537,9 +534,7 @@ typedef struct Command
 	MetaCommand meta;
 	int			argc;
 	char	   *argv[MAX_ARGS];
-	int			nqueries;
-	char	  **varprefix;
-	int			varprefix_max;
+	char	   *varprefix;
 	PgBenchExpr *expr;
 	SimpleStats stats;
 } Command;
@@ -612,14 +607,13 @@ static void setIntValue(PgBenchValue *pv, int64 ival);
 static void setDoubleValue(PgBenchValue *pv, double dval);
 static bool evaluateExpr(TState *thread, CState *st, PgBenchExpr *expr,
 			 PgBenchValue *retval);
-static instr_time doExecuteCommand(TState *thread, CState *st,
-				 instr_time now);
+static ConnectionStateEnum executeMetaCommand(TState *thread, CState *st,
+				   instr_time *now);
 static void doLog(TState *thread, CState *st,
 	  StatsData *agg, bool skipped, double latency, double lag);
 static void processXactStats(TState *thread, CState *st, instr_time *now,
 				 bool skipped, StatsData *agg);
 static void pgbench_error(const char *fmt,...) pg_attribute_printf(1, 2);
-static void allocate_command_varprefix(Command *cmd, int totalqueries);
 static void addScript(ParsedScript script);
 static void *threadRun(void *arg);
 static void finishCon(CState *st);
@@ -808,7 +802,7 @@ out_of_range:
 invalid_syntax:
 	if (!errorOK)
 		fprintf(stderr,
-				"invalid input syntax for type bigint: \"%s\"\n",str);
+				"invalid input syntax for type bigint: \"%s\"\n", str);
 	return false;
 }
 
@@ -833,7 +827,7 @@ strtodouble(const char *str, bool errorOK, double *dv)
 	{
 		if (!errorOK)
 			fprintf(stderr,
-					"invalid input syntax for type double: \"%s\"\n",str);
+					"invalid input syntax for type double: \"%s\"\n", str);
 		return false;
 	}
 	return true;
@@ -2614,8 +2608,6 @@ getMetaCommand(const char *cmd)
 		mc = META_ELSE;
 	else if (pg_strcasecmp(cmd, "endif") == 0)
 		mc = META_ENDIF;
-	else if (pg_strcasecmp(cmd, "cset") == 0)
-		mc = META_CSET;
 	else if (pg_strcasecmp(cmd, "gset") == 0)
 		mc = META_GSET;
 	else
@@ -2848,24 +2840,30 @@ sendCommand(CState *st, Command *command)
 /*
  * Process query response from the backend.
  *
- * If varprefix is not NULL, it's the array of variable prefix names where to
- * store the results.
+ * If varprefix is not NULL, it's the variable name prefix where to store
+ * the results of the *last* command.
  *
  * Returns true if everything is A-OK, false if any error occurs.
  */
 static bool
-readCommandResponse(CState *st, char **varprefix)
+readCommandResponse(CState *st, char *varprefix)
 {
 	PGresult   *res;
 	int			qrynum = 0;
 
-	while ((res = PQgetResult(st->con)) != NULL)
+	res = PQgetResult(st->con);
+
+	while (res != NULL)
 	{
+		/* look now at the next result to know whether it is the last */
+		PGresult	*next_res = PQgetResult(st->con);
+		bool is_last = (next_res == NULL);
+
 		switch (PQresultStatus(res))
 		{
 			case PGRES_COMMAND_OK:	/* non-SELECT commands */
 			case PGRES_EMPTY_QUERY: /* may be used for testing no-op overhead */
-				if (varprefix && varprefix[qrynum] != NULL)
+				if (is_last && varprefix != NULL)
 				{
 					fprintf(stderr,
 							"client %d script %d command %d query %d: expected one row, got %d\n",
@@ -2876,7 +2874,7 @@ readCommandResponse(CState *st, char **varprefix)
 				break;
 
 			case PGRES_TUPLES_OK:
-				if (varprefix && varprefix[qrynum] != NULL)
+				if (is_last && varprefix != NULL)
 				{
 					if (PQntuples(res) != 1)
 					{
@@ -2895,9 +2893,8 @@ readCommandResponse(CState *st, char **varprefix)
 						char	   *varname = PQfname(res, fld);
 
 						/* allocate varname only if necessary, freed below */
-						if (*varprefix[qrynum] != '\0')
-							varname =
-								psprintf("%s%s", varprefix[qrynum], varname);
+						if (*varprefix != '\0')
+							varname = psprintf("%s%s", varprefix, varname);
 
 						/* store result as a string */
 						if (!putVariable(st, "gset", varname,
@@ -2914,7 +2911,7 @@ readCommandResponse(CState *st, char **varprefix)
 							return false;
 						}
 
-						if (*varprefix[qrynum] != '\0')
+						if (*varprefix != '\0')
 							pg_free(varname);
 					}
 				}
@@ -2935,6 +2932,7 @@ readCommandResponse(CState *st, char **varprefix)
 
 		PQclear(res);
 		qrynum++;
+		res = next_res;
 	}
 
 	if (qrynum == 0)
@@ -3014,6 +3012,8 @@ advanceConnectionState(TState *thread, CState *st, StatsData *agg)
 	 */
 	for (;;)
 	{
+		Command    *command;
+
 		switch (st->state)
 		{
 				/* Select transaction (script) to run.  */
@@ -3153,8 +3153,10 @@ advanceConnectionState(TState *thread, CState *st, StatsData *agg)
 				 * Send a command to server (or execute a meta-command)
 				 */
 			case CSTATE_START_COMMAND:
+				command = sql_script[st->use_file].commands[st->command];
+
 				/* Transition to script end processing if done */
-				if (sql_script[st->use_file].commands[st->command] == NULL)
+				if (command == NULL)
 				{
 					st->state = CSTATE_END_TX;
 					break;
@@ -3166,7 +3168,28 @@ advanceConnectionState(TState *thread, CState *st, StatsData *agg)
 					INSTR_TIME_SET_CURRENT_LAZY(now);
 					st->stmt_begin = now;
 				}
-				now = doExecuteCommand(thread, st, now);
+
+				/* Execute the command */
+				if (command->type == SQL_COMMAND)
+				{
+					if (!sendCommand(st, command))
+					{
+						commandFailed(st, "SQL", "SQL command send failed");
+						st->state = CSTATE_ABORTED;
+					}
+					else
+						st->state = CSTATE_WAIT_RESULT;
+				}
+				else if (command->type == META_COMMAND)
+				{
+					/*-----
+					 * Possible state changes when executing meta commands:
+					 * - on errors CSTATE_ABORTED
+					 * - on sleep CSTATE_SLEEP
+					 * - else CSTATE_END_COMMAND
+					 */
+					st->state = executeMetaCommand(thread, st, &now);
+				}
 
 				/*
 				 * We're now waiting for an SQL command to complete, or
@@ -3239,7 +3262,8 @@ advanceConnectionState(TState *thread, CState *st, StatsData *agg)
 							case IFSTATE_IGNORED:
 							case IFSTATE_ELSE_FALSE:
 								if (command->meta == META_IF)
-									conditional_stack_push(st->cstack, IFSTATE_IGNORED);
+									conditional_stack_push(st->cstack,
+														   IFSTATE_IGNORED);
 								else if (command->meta == META_ENDIF)
 								{
 									Assert(!conditional_stack_empty(st->cstack));
@@ -3389,179 +3413,155 @@ advanceConnectionState(TState *thread, CState *st, StatsData *agg)
 }
 
 /*
- * Subroutine for advanceConnectionState -- execute or initiate the current
- * command, and transition to next state appropriately.
+ * Subroutine for advanceConnectionState -- initiate or execute the current
+ * meta command, and return the next state to set.
  *
- * Returns an updated timestamp from 'now', used to update 'now' at callsite.
+ * *now is updated to the current time, unless the command is expected to
+ * take no time to execute.
  */
-static instr_time
-doExecuteCommand(TState *thread, CState *st, instr_time now)
+static ConnectionStateEnum
+executeMetaCommand(TState *thread, CState *st, instr_time *now)
 {
 	Command    *command = sql_script[st->use_file].commands[st->command];
+	int			argc;
+	char	  **argv;
 
-	/* execute the command */
-	if (command->type == SQL_COMMAND)
+	Assert(command != NULL && command->type == META_COMMAND);
+
+	argc = command->argc;
+	argv = command->argv;
+
+	if (debug)
 	{
-		if (!sendCommand(st, command))
-		{
-			commandFailed(st, "SQL", "SQL command send failed");
-			st->state = CSTATE_ABORTED;
-		}
-		else
-			st->state = CSTATE_WAIT_RESULT;
+		fprintf(stderr, "client %d executing \\%s", st->id, argv[0]);
+		for (int i = 1; i < argc; i++)
+			fprintf(stderr, " %s", argv[i]);
+		fprintf(stderr, "\n");
 	}
-	else if (command->type == META_COMMAND)
+
+	if (command->meta == META_SLEEP)
 	{
-		int			argc = command->argc;
-		char	  **argv = command->argv;
-
-		if (debug)
-		{
-			fprintf(stderr, "client %d executing \\%s",
-					st->id, argv[0]);
-			for (int i = 1; i < argc; i++)
-				fprintf(stderr, " %s", argv[i]);
-			fprintf(stderr, "\n");
-		}
-
-		if (command->meta == META_SLEEP)
-		{
-			int			usec;
-
-			/*
-			 * A \sleep doesn't execute anything, we just get the delay from
-			 * the argument, and enter the CSTATE_SLEEP state.  (The
-			 * per-command latency will be recorded in CSTATE_SLEEP state, not
-			 * here, after the delay has elapsed.)
-			 */
-			if (!evaluateSleep(st, argc, argv, &usec))
-			{
-				commandFailed(st, "sleep", "execution of meta-command failed");
-				st->state = CSTATE_ABORTED;
-				return now;
-			}
-
-			INSTR_TIME_SET_CURRENT_LAZY(now);
-
-			st->sleep_until = INSTR_TIME_GET_MICROSEC(now) + usec;
-			st->state = CSTATE_SLEEP;
-			return now;
-		}
-		else if (command->meta == META_SET)
-		{
-			PgBenchExpr *expr = command->expr;
-			PgBenchValue result;
-
-			if (!evaluateExpr(thread, st, expr, &result))
-			{
-				commandFailed(st, argv[0], "evaluation of meta-command failed");
-				st->state = CSTATE_ABORTED;
-				return now;
-			}
-
-			if (!putVariableValue(st, argv[0], argv[1], &result))
-			{
-				commandFailed(st, "set", "assignment of meta-command failed");
-				st->state = CSTATE_ABORTED;
-				return now;
-			}
-		}
-		else if (command->meta == META_IF)
-		{
-			/* backslash commands with an expression to evaluate */
-			PgBenchExpr *expr = command->expr;
-			PgBenchValue result;
-			bool		cond;
-
-			if (!evaluateExpr(thread, st, expr, &result))
-			{
-				commandFailed(st, argv[0], "evaluation of meta-command failed");
-				st->state = CSTATE_ABORTED;
-				return now;
-			}
-
-			cond = valueTruth(&result);
-			conditional_stack_push(st->cstack, cond ? IFSTATE_TRUE : IFSTATE_FALSE);
-		}
-		else if (command->meta == META_ELIF)
-		{
-			/* backslash commands with an expression to evaluate */
-			PgBenchExpr *expr = command->expr;
-			PgBenchValue result;
-			bool		cond;
-
-			if (conditional_stack_peek(st->cstack) == IFSTATE_TRUE)
-			{
-				/*
-				 * elif after executed block, skip eval and wait for endif.
-				 */
-				conditional_stack_poke(st->cstack, IFSTATE_IGNORED);
-				st->state = CSTATE_END_COMMAND;
-				return now;
-			}
-
-			if (!evaluateExpr(thread, st, expr, &result))
-			{
-				commandFailed(st, argv[0], "evaluation of meta-command failed");
-				st->state = CSTATE_ABORTED;
-				return now;
-			}
-
-			cond = valueTruth(&result);
-			Assert(conditional_stack_peek(st->cstack) == IFSTATE_FALSE);
-			conditional_stack_poke(st->cstack, cond ? IFSTATE_TRUE : IFSTATE_FALSE);
-		}
-		else if (command->meta == META_ELSE)
-		{
-			switch (conditional_stack_peek(st->cstack))
-			{
-				case IFSTATE_TRUE:
-					conditional_stack_poke(st->cstack, IFSTATE_ELSE_FALSE);
-					break;
-				case IFSTATE_FALSE: /* inconsistent if active */
-				case IFSTATE_IGNORED:	/* inconsistent if active */
-				case IFSTATE_NONE:	/* else without if */
-				case IFSTATE_ELSE_TRUE: /* else after else */
-				case IFSTATE_ELSE_FALSE:	/* else after else */
-				default:
-					/* dead code if conditional check is ok */
-					Assert(false);
-			}
-		}
-		else if (command->meta == META_ENDIF)
-		{
-			Assert(!conditional_stack_empty(st->cstack));
-			conditional_stack_pop(st->cstack);
-		}
-		else if (command->meta == META_SETSHELL)
-		{
-			if (!runShellCommand(st, argv[1], argv + 2, argc - 2))
-			{
-				commandFailed(st, "setshell", "execution of meta-command failed");
-				st->state = CSTATE_ABORTED;
-				return now;
-			}
-		}
-		else if (command->meta == META_SHELL)
-		{
-			if (!runShellCommand(st, NULL, argv + 1, argc - 1))
-			{
-				commandFailed(st, "shell", "execution of meta-command failed");
-				st->state = CSTATE_ABORTED;
-				return now;
-			}
-		}
+		int			usec;
 
 		/*
-		 * executing the expression or shell command might have taken a
-		 * non-negligible amount of time, so reset 'now'
+		 * A \sleep doesn't execute anything, we just get the delay from the
+		 * argument, and enter the CSTATE_SLEEP state.  (The per-command
+		 * latency will be recorded in CSTATE_SLEEP state, not here, after the
+		 * delay has elapsed.)
 		 */
-		INSTR_TIME_SET_ZERO(now);
+		if (!evaluateSleep(st, argc, argv, &usec))
+		{
+			commandFailed(st, "sleep", "execution of meta-command failed");
+			return CSTATE_ABORTED;
+		}
 
-		st->state = CSTATE_END_COMMAND;
+		INSTR_TIME_SET_CURRENT_LAZY(*now);
+		st->sleep_until = INSTR_TIME_GET_MICROSEC(*now) + usec;
+		return CSTATE_SLEEP;
+	}
+	else if (command->meta == META_SET)
+	{
+		PgBenchExpr *expr = command->expr;
+		PgBenchValue result;
+
+		if (!evaluateExpr(thread, st, expr, &result))
+		{
+			commandFailed(st, argv[0], "evaluation of meta-command failed");
+			return CSTATE_ABORTED;
+		}
+
+		if (!putVariableValue(st, argv[0], argv[1], &result))
+		{
+			commandFailed(st, "set", "assignment of meta-command failed");
+			return CSTATE_ABORTED;
+		}
+	}
+	else if (command->meta == META_IF)
+	{
+		/* backslash commands with an expression to evaluate */
+		PgBenchExpr *expr = command->expr;
+		PgBenchValue result;
+		bool		cond;
+
+		if (!evaluateExpr(thread, st, expr, &result))
+		{
+			commandFailed(st, argv[0], "evaluation of meta-command failed");
+			return CSTATE_ABORTED;
+		}
+
+		cond = valueTruth(&result);
+		conditional_stack_push(st->cstack, cond ? IFSTATE_TRUE : IFSTATE_FALSE);
+	}
+	else if (command->meta == META_ELIF)
+	{
+		/* backslash commands with an expression to evaluate */
+		PgBenchExpr *expr = command->expr;
+		PgBenchValue result;
+		bool		cond;
+
+		if (conditional_stack_peek(st->cstack) == IFSTATE_TRUE)
+		{
+			/* elif after executed block, skip eval and wait for endif. */
+			conditional_stack_poke(st->cstack, IFSTATE_IGNORED);
+			return CSTATE_END_COMMAND;
+		}
+
+		if (!evaluateExpr(thread, st, expr, &result))
+		{
+			commandFailed(st, argv[0], "evaluation of meta-command failed");
+			return CSTATE_ABORTED;
+		}
+
+		cond = valueTruth(&result);
+		Assert(conditional_stack_peek(st->cstack) == IFSTATE_FALSE);
+		conditional_stack_poke(st->cstack, cond ? IFSTATE_TRUE : IFSTATE_FALSE);
+	}
+	else if (command->meta == META_ELSE)
+	{
+		switch (conditional_stack_peek(st->cstack))
+		{
+			case IFSTATE_TRUE:
+				conditional_stack_poke(st->cstack, IFSTATE_ELSE_FALSE);
+				break;
+			case IFSTATE_FALSE: /* inconsistent if active */
+			case IFSTATE_IGNORED:	/* inconsistent if active */
+			case IFSTATE_NONE:	/* else without if */
+			case IFSTATE_ELSE_TRUE: /* else after else */
+			case IFSTATE_ELSE_FALSE:	/* else after else */
+			default:
+				/* dead code if conditional check is ok */
+				Assert(false);
+		}
+	}
+	else if (command->meta == META_ENDIF)
+	{
+		Assert(!conditional_stack_empty(st->cstack));
+		conditional_stack_pop(st->cstack);
+	}
+	else if (command->meta == META_SETSHELL)
+	{
+		if (!runShellCommand(st, argv[1], argv + 2, argc - 2))
+		{
+			commandFailed(st, "setshell", "execution of meta-command failed");
+			return CSTATE_ABORTED;
+		}
+	}
+	else if (command->meta == META_SHELL)
+	{
+		if (!runShellCommand(st, NULL, argv + 1, argc - 1))
+		{
+			commandFailed(st, "shell", "execution of meta-command failed");
+			return CSTATE_ABORTED;
+		}
 	}
 
-	return now;
+	/*
+	 * executing the expression or shell command might have taken a
+	 * non-negligible amount of time, so reset 'now'
+	 */
+	INSTR_TIME_SET_ZERO(*now);
+
+	return CSTATE_END_COMMAND;
 }
 
 /*
@@ -4248,7 +4248,7 @@ skip_sql_comments(char *sql_command)
  * struct.
  */
 static Command *
-create_sql_command(PQExpBuffer buf, const char *source, int numqueries)
+create_sql_command(PQExpBuffer buf, const char *source)
 {
 	Command    *my_command;
 	char	   *p = skip_sql_comments(buf->data);
@@ -4265,9 +4265,7 @@ create_sql_command(PQExpBuffer buf, const char *source, int numqueries)
 	my_command->meta = META_NONE;
 	my_command->argc = 0;
 	memset(my_command->argv, 0, sizeof(my_command->argv));
-	my_command->nqueries = numqueries;
 	my_command->varprefix = NULL;	/* allocated later, if needed */
-	my_command->varprefix_max = 0;
 	my_command->expr = NULL;
 	initSimpleStats(&my_command->stats);
 
@@ -4284,37 +4282,13 @@ free_command(Command *command)
 	for (int i = 0; i < command->argc; i++)
 		pg_free(command->argv[i]);
 	if (command->varprefix)
-	{
-		for (int i = 0; i < command->varprefix_max; i++)
-			if (command->varprefix[i] &&
-				command->varprefix[i][0] != '\0')	/* see ParseScript */
-				pg_free(command->varprefix[i]);
 		pg_free(command->varprefix);
-	}
+
 	/*
 	 * It should also free expr recursively, but this is currently not needed
-	 * as only \{g,c}set commands (which do not have an expression) are freed.
+	 * as only gset commands (which do not have an expression) are freed.
 	 */
 	pg_free(command);
-}
-
-/*
- * append "more" text to current compound command which had been interrupted
- * by \cset.
- */
-static void
-append_sql_command(Command *my_command, char *more, int numqueries)
-{
-	Assert(my_command->type == SQL_COMMAND && my_command->lines.len > 0);
-
-	more = skip_sql_comments(more);
-	if (more == NULL)
-		return;
-
-	/* append command text, embedding a ';' in place of the \cset */
-	appendPQExpBuffer(&my_command->lines, ";\n%s", more);
-
-	my_command->nqueries += numqueries;
 }
 
 /*
@@ -4348,35 +4322,6 @@ postprocess_sql_command(Command *my_command)
 		default:
 			exit(1);
 	}
-}
-
-/*
- * Determine the command's varprefix size needed and allocate memory for it
- */
-static void
-allocate_command_varprefix(Command *cmd, int totalqueries)
-{
-	int			new_max;
-
-	/* sufficient space already allocated? */
-	if (totalqueries <= cmd->varprefix_max)
-		return;
-
-	/* determine the new array size */
-	new_max = Max(cmd->varprefix_max, 2);
-	while (new_max < totalqueries)
-		new_max *= 2;
-
-	/* enlarge the array, zero-initializing the allocated space */
-	if (cmd->varprefix == NULL)
-		cmd->varprefix = pg_malloc0(sizeof(char *) * new_max);
-	else
-	{
-		cmd->varprefix = pg_realloc(cmd->varprefix, sizeof(char *) * new_max);
-		memset(cmd->varprefix + cmd->varprefix_max, 0,
-			   sizeof(char *) * (new_max - cmd->varprefix_max));
-	}
-	cmd->varprefix_max = new_max;
 }
 
 /*
@@ -4549,7 +4494,7 @@ process_backslash_command(PsqlScanState sstate, const char *source)
 			syntax_error(source, lineno, my_command->first_line, my_command->argv[0],
 						 "unexpected argument", NULL, -1);
 	}
-	else if (my_command->meta == META_CSET || my_command->meta == META_GSET)
+	else if (my_command->meta == META_GSET)
 	{
 		if (my_command->argc > 2)
 			syntax_error(source, lineno, my_command->first_line, my_command->argv[0],
@@ -4637,7 +4582,6 @@ ParseScript(const char *script, const char *desc, int weight)
 	PQExpBufferData line_buf;
 	int			alloc_num;
 	int			index;
-	bool		saw_cset = false;
 	int			lineno;
 	int			start_offset;
 
@@ -4674,31 +4618,18 @@ ParseScript(const char *script, const char *desc, int weight)
 		PsqlScanResult sr;
 		promptStatus_t prompt;
 		Command    *command = NULL;
-		int			semicolons;
 
 		resetPQExpBuffer(&line_buf);
 		lineno = expr_scanner_get_lineno(sstate, start_offset);
 
 		sr = psql_scan(sstate, &line_buf, &prompt);
 
-		semicolons = psql_scan_get_escaped_semicolons(sstate);
+		/* If we collected a new SQL command, process that */
+		command = create_sql_command(&line_buf, desc);
 
-		if (saw_cset)
-		{
-			/* the previous multi-line command ended with \cset */
-			append_sql_command(ps.commands[index - 1], line_buf.data,
-							   semicolons + 1);
-			saw_cset = false;
-		}
-		else
-		{
-			/* If we collected a new SQL command, process that */
-			command = create_sql_command(&line_buf, desc, semicolons + 1);
-
-			/* store new command */
-			if (command)
-				ps.commands[index++] = command;
-		}
+		/* store new command */
+		if (command)
+			ps.commands[index++] = command;
 
 		/* If we reached a backslash, process that */
 		if (sr == PSCAN_BACKSLASH)
@@ -4708,56 +4639,31 @@ ParseScript(const char *script, const char *desc, int weight)
 			if (command)
 			{
 				/*
-				 * If this is gset/cset, merge into the preceding command. (We
+				 * If this is gset, merge into the preceding command. (We
 				 * don't use a command slot in this case).
 				 */
-				if (command->meta == META_CSET ||
-					command->meta == META_GSET)
+				if (command->meta == META_GSET)
 				{
-					int			cindex;
 					Command    *cmd;
-
-					/*
-					 * If \cset is seen, set flag to leave the command pending
-					 * for the next iteration to process.
-					 */
-					saw_cset = command->meta == META_CSET;
 
 					if (index == 0)
 						syntax_error(desc, lineno, NULL, NULL,
-									 "\\gset/cset cannot start a script",
+									 "\\gset must follow a SQL command",
 									 NULL, -1);
 
 					cmd = ps.commands[index - 1];
 
-					if (cmd->type != SQL_COMMAND)
+					if (cmd->type != SQL_COMMAND ||
+						cmd->varprefix != NULL)
 						syntax_error(desc, lineno, NULL, NULL,
-									 "\\gset/cset must follow a SQL command",
+									 "\\gset must follow a SQL command",
 									 cmd->first_line, -1);
-
-					/* this {g,c}set applies to the previous query */
-					cindex = cmd->nqueries - 1;
-
-					/*
-					 * now that we know there's a {g,c}set in this command,
-					 * allocate space for the variable name prefix array.
-					 */
-					allocate_command_varprefix(cmd, cmd->nqueries);
-
-					/*
-					 * Don't allow the previous command be a gset/cset; that
-					 * would make no sense.
-					 */
-					if (cmd->varprefix[cindex] != NULL)
-						syntax_error(desc, lineno, NULL, NULL,
-									 "\\gset/cset cannot follow one another",
-									 NULL, -1);
 
 					/* get variable prefix */
 					if (command->argc <= 1 || command->argv[1][0] == '\0')
-						cmd->varprefix[cindex] = "";	/* avoid strdup */
+						cmd->varprefix = pg_strdup("");
 					else
-						cmd->varprefix[cindex] = pg_strdup(command->argv[1]);
+						cmd->varprefix = pg_strdup(command->argv[1]);
 
 					/* cleanup unused command */
 					free_command(command);
@@ -4988,6 +4894,99 @@ addScript(ParsedScript script)
 
 	sql_script[num_scripts] = script;
 	num_scripts++;
+}
+
+/*
+ * Print progress report.
+ *
+ * On entry, *last and *last_report contain the statistics and time of last
+ * progress report.  On exit, they are updated with the new stats.
+ */
+static void
+printProgressReport(TState *thread, int64 test_start, int64 now,
+					StatsData *last, int64 *last_report)
+{
+	/* generate and show report */
+	int64		run = now - *last_report,
+				ntx;
+	double		tps,
+				total_run,
+				latency,
+				sqlat,
+				lag,
+				stdev;
+	char		tbuf[315];
+	StatsData	cur;
+
+	/*
+	 * Add up the statistics of all threads.
+	 *
+	 * XXX: No locking.  There is no guarantee that we get an atomic snapshot
+	 * of the transaction count and latencies, so these figures can well be
+	 * off by a small amount.  The progress report's purpose is to give a
+	 * quick overview of how the test is going, so that shouldn't matter too
+	 * much.  (If a read from a 64-bit integer is not atomic, you might get a
+	 * "torn" read and completely bogus latencies though!)
+	 */
+	initStats(&cur, 0);
+	for (int i = 0; i < nthreads; i++)
+	{
+		mergeSimpleStats(&cur.latency, &thread[i].stats.latency);
+		mergeSimpleStats(&cur.lag, &thread[i].stats.lag);
+		cur.cnt += thread[i].stats.cnt;
+		cur.skipped += thread[i].stats.skipped;
+	}
+
+	/* we count only actually executed transactions */
+	ntx = (cur.cnt - cur.skipped) - (last->cnt - last->skipped);
+	total_run = (now - test_start) / 1000000.0;
+	tps = 1000000.0 * ntx / run;
+	if (ntx > 0)
+	{
+		latency = 0.001 * (cur.latency.sum - last->latency.sum) / ntx;
+		sqlat = 1.0 * (cur.latency.sum2 - last->latency.sum2) / ntx;
+		stdev = 0.001 * sqrt(sqlat - 1000000.0 * latency * latency);
+		lag = 0.001 * (cur.lag.sum - last->lag.sum) / ntx;
+	}
+	else
+	{
+		latency = sqlat = stdev = lag = 0;
+	}
+
+	if (progress_timestamp)
+	{
+		/*
+		 * On some platforms the current system timestamp is available in
+		 * now_time, but rather than get entangled with that, we just eat the
+		 * cost of an extra syscall in all cases.
+		 */
+		struct timeval tv;
+
+		gettimeofday(&tv, NULL);
+		snprintf(tbuf, sizeof(tbuf), "%ld.%03ld s",
+				 (long) tv.tv_sec, (long) (tv.tv_usec / 1000));
+	}
+	else
+	{
+		/* round seconds are expected, but the thread may be late */
+		snprintf(tbuf, sizeof(tbuf), "%.1f s", total_run);
+	}
+
+	fprintf(stderr,
+			"progress: %s, %.1f tps, lat %.3f ms stddev %.3f",
+			tbuf, tps, latency, stdev);
+
+	if (throttle_delay)
+	{
+		fprintf(stderr, ", lag %.3f ms", lag);
+		if (latency_limit)
+			fprintf(stderr, ", " INT64_FORMAT " skipped",
+					cur.skipped - last->skipped);
+	}
+	fprintf(stderr, "\n");
+
+	*last = cur;
+	*last_report = now;
 }
 
 static void
@@ -5305,8 +5304,7 @@ main(int argc, char **argv)
 	else if ((env = getenv("PGUSER")) != NULL && *env != '\0')
 		login = env;
 
-	state = (CState *) pg_malloc(sizeof(CState));
-	memset(state, 0, sizeof(CState));
+	state = (CState *) pg_malloc0(sizeof(CState));
 
 	/* set random seed early, because it may be used while parsing scripts. */
 	if (!set_random_seed(getenv("PGBENCH_RANDOM_SEED")))
@@ -6296,89 +6294,7 @@ threadRun(void *arg)
 			now = INSTR_TIME_GET_MICROSEC(now_time);
 			if (now >= next_report)
 			{
-				/* generate and show report */
-				StatsData	cur;
-				int64		run = now - last_report,
-							ntx;
-				double		tps,
-							total_run,
-							latency,
-							sqlat,
-							lag,
-							stdev;
-				char		tbuf[315];
-
-				/*
-				 * Add up the statistics of all threads.
-				 *
-				 * XXX: No locking. There is no guarantee that we get an
-				 * atomic snapshot of the transaction count and latencies, so
-				 * these figures can well be off by a small amount. The
-				 * progress report's purpose is to give a quick overview of
-				 * how the test is going, so that shouldn't matter too much.
-				 * (If a read from a 64-bit integer is not atomic, you might
-				 * get a "torn" read and completely bogus latencies though!)
-				 */
-				initStats(&cur, 0);
-				for (i = 0; i < nthreads; i++)
-				{
-					mergeSimpleStats(&cur.latency, &thread[i].stats.latency);
-					mergeSimpleStats(&cur.lag, &thread[i].stats.lag);
-					cur.cnt += thread[i].stats.cnt;
-					cur.skipped += thread[i].stats.skipped;
-				}
-
-				/* we count only actually executed transactions */
-				ntx = (cur.cnt - cur.skipped) - (last.cnt - last.skipped);
-				total_run = (now - thread_start) / 1000000.0;
-				tps = 1000000.0 * ntx / run;
-				if (ntx > 0)
-				{
-					latency = 0.001 * (cur.latency.sum - last.latency.sum) / ntx;
-					sqlat = 1.0 * (cur.latency.sum2 - last.latency.sum2) / ntx;
-					stdev = 0.001 * sqrt(sqlat - 1000000.0 * latency * latency);
-					lag = 0.001 * (cur.lag.sum - last.lag.sum) / ntx;
-				}
-				else
-				{
-					latency = sqlat = stdev = lag = 0;
-				}
-
-				if (progress_timestamp)
-				{
-					/*
-					 * On some platforms the current system timestamp is
-					 * available in now_time, but rather than get entangled
-					 * with that, we just eat the cost of an extra syscall in
-					 * all cases.
-					 */
-					struct timeval tv;
-
-					gettimeofday(&tv, NULL);
-					snprintf(tbuf, sizeof(tbuf), "%ld.%03ld s",
-							 (long) tv.tv_sec, (long) (tv.tv_usec / 1000));
-				}
-				else
-				{
-					/* round seconds are expected, but the thread may be late */
-					snprintf(tbuf, sizeof(tbuf), "%.1f s", total_run);
-				}
-
-				fprintf(stderr,
-						"progress: %s, %.1f tps, lat %.3f ms stddev %.3f",
-						tbuf, tps, latency, stdev);
-
-				if (throttle_delay)
-				{
-					fprintf(stderr, ", lag %.3f ms", lag);
-					if (latency_limit)
-						fprintf(stderr, ", " INT64_FORMAT " skipped",
-								cur.skipped - last.skipped);
-				}
-				fprintf(stderr, "\n");
-
-				last = cur;
-				last_report = now;
+				printProgressReport(thread, thread_start, now, &last, &last_report);
 
 				/*
 				 * Ensure that the next report is in the future, in case

@@ -128,12 +128,10 @@ extern bool heap_getnextslot(TableScanDesc sscan,
 				 ScanDirection direction, struct TupleTableSlot *slot);
 
 extern bool heap_fetch(Relation relation, Snapshot snapshot,
-		   HeapTuple tuple, Buffer *userbuf, Relation stats_relation);
+		   HeapTuple tuple, Buffer *userbuf);
 extern bool heap_hot_search_buffer(ItemPointer tid, Relation relation,
 					   Buffer buffer, Snapshot snapshot, HeapTuple heapTuple,
 					   bool *all_dead, bool first_call);
-extern bool heap_hot_search(ItemPointer tid, Relation relation,
-				Snapshot snapshot, bool *all_dead);
 
 extern void heap_get_latest_tid(Relation relation, Snapshot snapshot,
 					ItemPointer tid);
@@ -175,6 +173,10 @@ extern void simple_heap_update(Relation relation, ItemPointer otid,
 				   HeapTuple tup);
 
 extern void heap_sync(Relation relation);
+
+extern TransactionId heap_compute_xid_horizon_for_tuples(Relation rel,
+									ItemPointerData *items,
+									int nitems);
 
 /* in heap/pruneheap.c */
 extern void heap_page_prune_opt(Relation relation, Buffer buffer);
